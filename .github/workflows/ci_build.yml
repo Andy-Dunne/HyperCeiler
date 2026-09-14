@@ -38,6 +38,7 @@ jobs:
           && !contains(github.event.head_commit.message, 'app: update version')
         )
       )
+    environment: ci
     runs-on: macos-latest
     name: Build App
     steps:
