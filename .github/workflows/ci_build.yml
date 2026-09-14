@@ -70,6 +70,13 @@ jobs:
           echo "GIT_ACTOR=${{ secrets.GIT_ACTOR }}" >> $GITHUB_ENV
           echo "GIT_TOKEN=${{ secrets.GIT_TOKEN }}" >> $GITHUB_ENV
 
+      - name: Create signing.properties
+        run: |
+          cat > signing.properties <<'EOF'
+          gpr.user=${{ secrets.GIT_ACTOR }}
+          gpr.key=${{ secrets.GIT_TOKEN }}
+          EOF
+
       - name: Build with Gradle (Canary)
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         shell: bash
