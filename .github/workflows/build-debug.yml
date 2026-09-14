@@ -1,0 +1,56 @@
+name: Build Debug (No Signing)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  build_debug:
+    runs-on: macos-latest
+
+    # 如果你把 GIT_ACTOR / GIT_TOKEN 放在 Environments 的 Secrets/Variables 里，这行是关键
+    environment: ci
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - name: Setup JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      # 只把需要的环境变量提供给 Gradle（settings.gradle.kts 会读取）
+      # 不创建 signing.properties（避免你 build.gradle.kts 把空字段当成 keystore）
+      - name: Export GIT_* to environment
+        shell: bash
+        run: |
+          echo "GIT_ACTOR=${{ secrets.GIT_ACTOR }}" >> $GITHUB_ENV
+          echo "GIT_TOKEN=${{ secrets.GIT_TOKEN }}" >> $GITHUB_ENV
+
+      # 也建议加一个不泄露 token 的检查，确认不是空
+      - name: Check env presence (length only)
+        shell: bash
+        run: |
+          echo "GIT_ACTOR length: ${#GIT_ACTOR}"
+          echo "GIT_TOKEN length: ${#GIT_TOKEN}"
+
+      - name: Build Debug APK
+        shell: bash
+        run: ./gradlew assembleDebug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk
+          path: |
+            app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
