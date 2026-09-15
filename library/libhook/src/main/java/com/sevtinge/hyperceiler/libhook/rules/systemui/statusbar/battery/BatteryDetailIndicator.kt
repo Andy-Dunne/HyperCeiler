@@ -213,16 +213,22 @@ object BatteryDetailIndicator : BaseHook() {
             XposedLog.e(HOOK_TAG, lpparam.packageName, "Failed to hook NetworkSpeedView.getSlot: ${it.message}")
         }
 
-        runCatching {
-            nsvCls.declaredMethods.filter { it.name == "setVisibleState" }.createBeforeHooks { param ->
-                val nsView = param.thisObject as? View
-                if (nsView != null && ViewHelper.isCustomTextIcon(nsView)) {
-                    val state = param.args[0] as? Int ?: 0
-                    val visible = state != 2
-                    val number = nsView.getObjectFieldOrNullAs<TextView>(FIELD_NETWORK_SPEED_NUMBER_TEXT) ?: (nsView as? TextView)
-                    number?.visibility = if (visible) View.VISIBLE else View.GONE
-                }
-            }
+         runCatching {
+            nsvCls.declaredMethods
+            .filter { it.name == "setVisibleState" }
+            .createAfterHooks { param ->
+                val nsView = param.thisObject as? View ?: return@createAfterHooks
+                if (!ViewHelper.isCustomTextIcon(nsView)) return@createAfterHooks
+                val state = param.args.getOrNull(0) as? Int ?: 0
+                val visible = state != 2
+                val number = nsView.getObjectFieldOrNullAs<TextView>(FIELD_NETWORK_SPEED_NUMBER_TEXT)
+                       ?: (nsView as? TextView)
+                number?.visibility = if (visible) View.VISIBLE else View.GONE
+
+                // Keyguard/lockscreen tends to rely on layout/paint refresh after visibility changes.
+                nsView.requestLayout()
+                nsView.invalidate()            
+               }
         }.onFailure {
             XposedLog.e(HOOK_TAG, lpparam.packageName, "Failed to hook NetworkSpeedView.setVisibleState: ${it.message}")
         }
