@@ -213,33 +213,21 @@ object BatteryDetailIndicator : BaseHook() {
             XposedLog.e(HOOK_TAG, lpparam.packageName, "Failed to hook NetworkSpeedView.getSlot: ${it.message}")
         }
 
-        runCatching {
-            nsvCls.declaredMethods.filter { it.name == "setVisibleState" }.createBeforeHooks { param ->
-                val nsView = param.thisObject as? View
-                if (nsView != null && ViewHelper.isCustomTextIcon(nsView)) {
-                    val state = param.args.getOrNull(0) as? Int ?: 0
-                    val visible = state != 2
+         runCatching {
+            nsvCls.declaredMethods
+            .filter { it.name == "setVisibleState" }
+            .createAfterHooks { param ->
+                val nsView = param.thisObject as? View ?: return@createAfterHooks
+                if (!ViewHelper.isCustomTextIcon(nsView)) return@createAfterHooks
+                val state = param.args.getOrNull(0) as? Int ?: 0
+                val visible = state != 2
+                val number = nsView.getObjectFieldOrNullAs<TextView>(FIELD_NETWORK_SPEED_NUMBER_TEXT)
+                       ?: (nsView as? TextView)
+                number?.visibility = if (visible) View.VISIBLE else View.GONE
 
-                    val number = nsView.getObjectFieldOrNullAs<TextView>(FIELD_NETWORK_SPEED_NUMBER_TEXT)
-                        ?: (nsView as? TextView)
-                    val unit = nsView.getObjectFieldOrNullAs<TextView>(FIELD_NETWORK_SPEED_UNIT_TEXT)
-
-                    val v = if (visible) View.VISIBLE else View.GONE
-                    number?.visibility = v
-                    unit?.visibility = v
-                    nsView.visibility = v
-
-                    nsView.invalidate()
-                    nsView.requestLayout()
-
-                    runCatching {
-                        number?.setLayerType(View.LAYER_TYPE_HARDWARE, null)
-                        number?.invalidate()
-                        number?.setLayerType(View.LAYER_TYPE_NONE, null)
-                        number?.invalidate()
-                    }
-                }
-            }
+                nsView.requestLayout()
+                nsView.invalidate()            
+               }
         }.onFailure {
             XposedLog.e(HOOK_TAG, lpparam.packageName, "Failed to hook NetworkSpeedView.setVisibleState: ${it.message}")
         }
@@ -411,7 +399,7 @@ object BatteryDetailIndicator : BaseHook() {
 
         private fun setupIconManager(nsvCls: Class<*>) {
             val iconManagerCls = loadClassOrNull("com.android.systemui.statusbar.phone.ui.IconManager", lpparam.classLoader)
-                ?: loadClassOrNull("com.android.systemui.statusbar.phone.ui.IconManager", lpparam.classLoader)
+                ?: loadClassOrNull("com.android.systemui.statusbar.phone.StatusBarIconController\$IconManager", lpparam.classLoader)
                 ?: return
 
             runCatching {
@@ -779,6 +767,10 @@ object BatteryDetailIndicator : BaseHook() {
             return iconView
         }
 
+        private fun isMultiLineContent(contentMode: Int): Boolean {
+            return contentMode == 1 || contentMode == 4 || contentMode == 5
+        }
+
         @SuppressLint("DiscouragedApi")
         fun initStatusbarTextIcon(
             mContext: Context,
@@ -833,6 +825,13 @@ object BatteryDetailIndicator : BaseHook() {
             when (align) {
                 2 -> iconTextView.gravity = Gravity.START or Gravity.CENTER_VERTICAL
                 3 -> iconTextView.gravity = Gravity.CENTER
+                4 -> iconTextView.gravity = Gravity.END or Gravity.CENTER_VERTICAL
+                else -> iconTextView.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            }
+        }
+    }
+}
+
                 4 -> iconTextView.gravity = Gravity.END or Gravity.CENTER_VERTICAL
                 else -> iconTextView.gravity = Gravity.START or Gravity.CENTER_VERTICAL
             }
