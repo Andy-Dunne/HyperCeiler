@@ -231,6 +231,13 @@ object BatteryDetailIndicator : BaseHook() {
 
                     nsView.invalidate()
                     nsView.requestLayout()
+
+                    runCatching {
+                        number?.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+                        number?.invalidate()
+                        number?.setLayerType(View.LAYER_TYPE_NONE, null)
+                        number?.invalidate()
+                    }
                 }
             }
         }.onFailure {
