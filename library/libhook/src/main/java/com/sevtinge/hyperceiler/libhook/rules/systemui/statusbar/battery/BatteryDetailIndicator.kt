@@ -39,6 +39,7 @@ import android.widget.TextView
 import com.sevtinge.hyperceiler.common.log.XposedLog
 import com.sevtinge.hyperceiler.common.utils.PrefsBridge
 import com.sevtinge.hyperceiler.libhook.base.BaseHook
+import com.sevtinge.hyperceiler.libhook.utils.hookapi.blur.MiBlurUtils
 import com.sevtinge.hyperceiler.libhook.utils.api.DeviceHelper.System.isMoreAndroidVersion
 import com.sevtinge.hyperceiler.libhook.utils.api.DisplayUtils.dp2px
 import io.github.lingqiqi5211.ezhooktool.core.callMethod
@@ -170,6 +171,51 @@ object BatteryDetailIndicator : BaseHook() {
      */
     private const val REQUEST_LAYOUT_ON_VISIBLE_STATE = false
 
+    // ================= 灵动岛（HyperOS4） =================
+
+    /**
+     * 灵动岛候选类名。日志实测：HyperOS4 的实现对在 `miui.systemui.dynamicisland.**`
+     * （且位于 systemui 插件里，要在插件加载后才能 load），老版本的名字放在后面兼容。
+     */
+    private val ISLAND_CLASS_CANDIDATES = listOf(
+        "miui.systemui.dynamicisland.view.DynamicIslandBigIslandView",
+        "miui.systemui.dynamicisland.view.DynamicIslandWindowViewImpl",
+        "miui.systemui.dynamicisland.view.DynamicIslandContentView",
+        "miui.systemui.dynamicisland.view.DynamicIslandBaseContentView",
+        "miui.systemui.dynamicisland.view.DynamicIslandContentFakeView",
+        "miui.systemui.dynamicisland.DynamicIslandWindowViewController",
+        "miui.systemui.dynamicisland.DynamicIslandWindowController",
+        "miui.systemui.dynamicisland.DynamicIslandController",
+        "miui.systemui.dynamicisland.DynamicIslandEventCoordinator",
+        "miui.systemui.dynamicisland.IslandTransitionExecutor",
+        "miui.systemui.dynamicisland.DynamicIslandAnimationDelegateHelper",
+        // 老版本（HyperOS2/3）名字，仅当兼容
+        "com.android.systemui.statusbar.phone.FocusedNotifPromptController",
+        "com.android.systemui.statusbar.phone.FocusedNotifPromptView",
+        "com.android.systemui.statusbar.phone.MiuiCollapsedStatusBarFragment",
+        "com.android.systemui.recents.LauncherProxyService",
+        "com.android.systemui.recents.OverviewProxyService"
+    )
+
+    private const val ISLAND_HOOK_MAX_ATTEMPTS = 30
+
+    /** 是否对比“我们的视图”与“系统自己视图（状态栏时钟）”的 MIUI 材质属性 */
+    private const val PROBE_MATERIAL = true
+
+    // ---- 三个候选修复，默认全关，一次只开一个试 ----
+
+    /** 方案1：每轮岛事件后把指示器自身的模糊/混合属性全部清掉 */
+    private const val CLEAR_OWN_BLUR = false
+
+    /** 方案2：按参考视图（状态栏时钟）把材质配置镜像到指示器 */
+    private const val MIRROR_REFERENCE_MATERIAL = false
+
+    /** 方案3：把指示器从父容器摘下来再挂回去，强制重新采集纹理 */
+    private const val REATTACH_ON_SETTLE = false
+
+    /** 方案4：整个窗口重画（最重，最后试） */
+    private const val FORCE_WINDOW_REDRAW_ON_SETTLE = false
+
     private const val TAG_SLOT_TEXT_ICON = "slot_text_icon"
     private const val TAG_NETWORK_SPEED_NUMBER = "network_speed_number"
     private const val TAG_NETWORK_SPEED_UNIT = "network_speed_unit"
@@ -287,6 +333,13 @@ object BatteryDetailIndicator : BaseHook() {
     private var burstWindowStart = 0L
     private var burstCount = 0
     private var lastBurstStackAt = 0L
+
+    // ---- 灵动岛 ----
+    private var islandHooksInstalled = false
+    private var islandHookAttempts = 0
+    private var pluginLoadHookInstalled = false
+    private val islandClassCache = java.util.concurrent.ConcurrentHashMap<Class<*>, Boolean>()
+    private val loggedIslandEvents: MutableSet<String> = java.util.Collections.synchronizedSet(HashSet())
 
     private data class TextIconInfo(
         var iconShow: Boolean = true,
@@ -409,11 +462,103 @@ object BatteryDetailIndicator : BaseHook() {
      * - LauncherProxyService / OverviewProxyService.onFocusedNotifUpdate：岛动画的目标矩形（几何重排）
      */
     private fun setupIslandEventHooks() {
-        hookIslandEvent(CLS_FOCUS_NOTIF_PROMPT_CONTROLLER, METHOD_NOTIFY_NOTIF_BEAN_CHANGED, "island.notifyChanged")
-        hookIslandEvent(CLS_FOCUS_NOTIF_PROMPT_VIEW, METHOD_SET_DATA, "island.setData")
-        hookIslandEvent(CLS_MIUI_COLLAPSED_STATUS_BAR, METHOD_UPDATE_STATUS_BAR_VISIBILITIES, "island.visibilities")
-        val recentsCls = if (isMoreAndroidVersion(36)) CLS_RECENTS_PROXY_NEW else CLS_RECENTS_PROXY_OLD
-        hookIslandEvent(recentsCls, METHOD_ON_FOCUSED_NOTIF_UPDATE, "island.animTarget")
+        ensureIslandEventHooks(null)
+        hookPluginLoadForIslandHooks()
+        setupGenericIslandViewDetector()
+    }
+
+    /**
+     * 安装灵动岛事件钩子（插件加载后才能真正装上）。
+     *
+     * 日志实测（HyperOS4，2026-09-16 20:04）：
+     * - `com.android.systemui.statusbar.phone.FocusedNotifPrompt*` / `MiuiCollapsedStatusBarFragment`
+     *   在这台设备上**全部 miss**（以前写的类名已经不存在了，所以灵动岛钩子从未生效）；
+     * - 真正的实现对在 **`miui.systemui.dynamicisland.**`**：logcat 里出现
+     *   `miui.systemui.dynamicisland.view.DynamicIslandBigIslandView`（`selfBlur` 日志）、
+     *   `DynamicIslandWindowViewController` / `DynamicIslandWindow`（独立窗口）/ `DynamicIslandService`；
+     * - 这些类位于 **MIUI systemui 插件** 里，而我们 init 的时候插件还没加载
+     *   （日志里插件在 20:04:09~10 才加载，我们 20:04:06 就 init 了），所以必须“插件加载后再补”。
+     */
+    private fun ensureIslandEventHooks(classLoader: ClassLoader?) {
+        if (islandHooksInstalled) return
+        if (islandHookAttempts++ > ISLAND_HOOK_MAX_ATTEMPTS) return
+        var installedAny = false
+        for (name in ISLAND_CLASS_CANDIDATES) {
+            val cls = loadClassOrNull(name, classLoader ?: lpparam.classLoader)
+                ?: loadClassOrNull(name, lpparam.classLoader)
+                ?: continue
+            runCatching {
+                val methods = cls.declaredMethods.toList().distinct()
+                methods.forEach { method ->
+                    if (method.name.startsWith("access$")) return@forEach
+                    runCatching {
+                        method.createBeforeHook {
+                            onIslandEvent("${cls.simpleName}#${method.name}", null)
+                        }
+                    }
+                }
+                diagLog(
+                    "island hooks installed: ${cls.name} (${methods.size} methods) " +
+                        methods.take(40).joinToString(",") { it.name }
+                )
+            }.onFailure {
+                XposedLog.e(HOOK_TAG, lpparam.packageName, "island hook all-methods failed: $name: ${it.message}")
+            }
+            installedAny = true
+        }
+        if (installedAny) {
+            islandHooksInstalled = true
+        } else if (DIAG_LOG && islandHookAttempts >= ISLAND_HOOK_MAX_ATTEMPTS) {
+            diagLog("island hooks: 所有候选类都没找到，等插件加载/降级到通用检测")
+        }
+    }
+
+    /** 插件加载完成后再补一次灵动岛钩子（与 NewPluginHelperKt 同一个入口） */
+    private fun hookPluginLoadForIslandHooks() {
+        if (pluginLoadHookInstalled) return
+        runCatching {
+            val cls = loadClassOrNull(
+                "com.android.systemui.shared.plugins.PluginInstance\$PluginFactory",
+                lpparam.classLoader
+            ) ?: return
+            cls.declaredMethods.filter { it.name == "createPluginContext" }.createAfterHooks { param ->
+                if (islandHooksInstalled) return@createAfterHooks
+                val loader = runCatching { param.result?.callMethod("getClassLoader") as? ClassLoader }.getOrNull()
+                    ?: runCatching {
+                        param.thisObject.getObjectFieldOrNull("mClassLoader") as? ClassLoader
+                    }.getOrNull()
+                if (loader != null) ensureIslandEventHooks(loader)
+            }
+            pluginLoadHookInstalled = true
+        }.onFailure {
+            XposedLog.e(HOOK_TAG, lpparam.packageName, "hook plugin load failed: ${it.message}")
+        }
+    }
+
+    /**
+     * 通用兵：不知道 HyperOS 每个版本的具体类名时，用“类名包含 island”的 View 回调兜底。
+     * 只挂 3 个 View 方法，并用类缓存避免每次调用都做字符串判断。
+     */
+    private fun setupGenericIslandViewDetector() {
+        runCatching {
+            val viewCls = android.view.View::class.java
+            listOf("onAttachedToWindow", "onVisibilityChanged", "setVisibility").forEach { name ->
+                viewCls.declaredMethods.filter { it.name == name }.createBeforeHooks { param ->
+                    val v = param.thisObject as? View ?: return@createBeforeHooks
+                    if (!isIslandView(v.javaClass)) return@createBeforeHooks
+                    onIslandEvent("generic.$name:${v.javaClass.simpleName}", v)
+                }
+            }
+        }.onFailure {
+            XposedLog.e(HOOK_TAG, lpparam.packageName, "generic island detector failed: ${it.message}")
+        }
+    }
+
+    private fun isIslandView(cls: Class<*>): Boolean {
+        islandClassCache[cls]?.let { return it }
+        val hit = cls.name.contains("island", ignoreCase = true) || cls.name.contains("dynamicisland", ignoreCase = true)
+        islandClassCache[cls] = hit
+        return hit
     }
 
     private fun hookIslandEvent(className: String, methodName: String, reason: String) {
@@ -439,15 +584,14 @@ object BatteryDetailIndicator : BaseHook() {
     }
 
     /**
-     * 灵动岛事件现场快照：重点是对比“岛”和“我们的指示器”在屏幕上的矩形是否重叠。
-     * 这是判定“糊”到底是“被岛/材质遮住”还是“主状态机相关”的关键数据。
+     * 灵动岛事件现场快照：
+     * - 岛视图 vs 指示器的屏幕矩形（判断是否被遮住）；
+     * - 指示器与“参考视图（状态栏时钟）”的 MIUI 材质属性对比（判断是不是材质管线把文字烤糊了）。
      */
     private fun onIslandEvent(reason: String, source: View?) {
-        if (!DIAG_LOG) {
-            scheduleRenderReset(reason)
-            return
+        if (DIAG_LOG && loggedIslandEvents.add(reason)) {
+            diagLog("island event(new): $reason")
         }
-        diagLog("island event: $reason")
         if (source != null) {
             val island = IntArray(2)
             runCatching { source.getLocationOnScreen(island) }
@@ -458,22 +602,137 @@ object BatteryDetailIndicator : BaseHook() {
                     "${island[0] + iw},${island[1] + ih}] size=${iw}x$ih vis=${source.visibility} " +
                     "alpha=${source.alpha} scale=${source.scaleX},${source.scaleY} layer=${source.layerType}"
             )
+            if (PROBE_MATERIAL) diagLog(materialProbe(source, "island"))
+        }
+        if (PROBE_MATERIAL) {
             for (view in mStatusbarTextIcons) {
                 if (!view.isAttachedToWindow) continue
                 val loc = IntArray(2)
                 runCatching { view.getLocationOnScreen(loc) }
                 val w = view.width
                 val h = view.height
-                val overlapX = w > 0 && iw > 0 && loc[0] < island[0] + iw && island[0] < loc[0] + w
-                val overlapY = h > 0 && ih > 0 && loc[1] < island[1] + ih && island[1] < loc[1] + h
                 diagLog(
                     "  ours host=${hostName(view)} onScreen=[${loc[0]},${loc[1]},${loc[0] + w},${loc[1] + h}] " +
-                        "shown=${runCatching { view.isShown }.getOrDefault(false)} overlapX=$overlapX overlapY=$overlapY"
+                        "shown=${runCatching { view.isShown }.getOrDefault(false)}"
                 )
+                diagLog(materialProbe(view, "ours@${hostName(view)}"))
+                findClockOf(view)?.let { diagLog(materialProbe(it, "clock-ref")) }
             }
         }
         scheduleRenderReset(reason)
     }
+
+    /**
+     * 岛事件后的“修复尝试”（都在开关后面，默认关，一个一个试）。
+     * @param settle true 表示动画应该已经结束（+700ms/+1500ms），此时修才不会被系统改回去
+     */
+    private fun islandRepair(reason: String, settle: Boolean) {
+        if (!settle) return
+        for (view in mStatusbarTextIcons) {
+            if (!view.isAttachedToWindow) continue
+            if (CLEAR_OWN_BLUR) clearOwnBlur(view, reason)
+            if (MIRROR_REFERENCE_MATERIAL) mirrorReferenceMaterial(view, reason)
+            if (REATTACH_ON_SETTLE) reattachIndicator(view, reason)
+            if (FORCE_WINDOW_REDRAW_ON_SETTLE) forceWindowRedraw(view, reason)
+        }
+    }
+
+    /** 方案2：把指示器自身的 MIUI 模糊/混合属性全部清掉 */
+    private fun clearOwnBlur(view: View, reason: String) {
+        runCatching {
+            MiBlurUtils.clearContainerPassBlur(view)
+            MiBlurUtils.clearMemberBlendColor(view)
+            miCall(view, "removeBackgroundBlurDrawable")
+            miCall(view, "setSelfBlurRadius", 0f)
+        }.onFailure {
+            XposedLog.e(HOOK_TAG, lpparam.packageName, "clearOwnBlur failed($reason): ${it.message}")
+        }
+    }
+
+    /**
+     * 方案3：按“清晰”的参考视图（状态栏时钟）把材质配置镜像过来。
+     * 日志已知：状态栏窗口（NotificationShade）存在 MIUI 的 PassBlur 通道（纹理缩放比 0.25），
+     * 而 MIUI 自己的文字视图是带材质配置的、我们注入的视图没有，所以先按参考视图配一份。
+     */
+    private fun mirrorReferenceMaterial(view: View, reason: String) {
+        val clock = findClockOf(view) ?: return
+        val mode = miInt(clock, "getMiViewBlurMode")
+        val bgMode = miInt(clock, "getMiBackgroundBlurMode")
+        val pass = miBool(clock, "getPassWindowBlurEnabled")
+        val color = runCatching { clock.currentTextColor }.getOrDefault(android.graphics.Color.WHITE)
+        miCall(view, "setMiViewBlurMode", mode ?: 0)
+        miCall(view, "setMiBackgroundBlurMode", bgMode ?: 0)
+        miCall(view, "setPassWindowBlurEnabled", pass ?: false)
+        runCatching { MiBlurUtils.setMemberBlendColor(view, false, color) }
+        diagLog("mirror($reason): clock mode=$mode bgMode=$bgMode pass=$pass color=${Integer.toHexString(color)}")
+    }
+
+    /** 方案4：把指示器从父容器里摘下来再挂回去，强制系统重新采集它的纹理 */
+    private fun reattachIndicator(view: View, reason: String) {
+        val parent = view.parent as? ViewGroup ?: return
+        val index = parent.indexOfChild(view)
+        if (index < 0) return
+        val lp = view.layoutParams
+        runCatching {
+            parent.removeView(view)
+            parent.addView(view, index.coerceAtMost(parent.childCount), lp)
+            diagLog("reattach($reason): host=${hostName(view)} index=$index")
+        }.onFailure {
+            XposedLog.e(HOOK_TAG, lpparam.packageName, "reattach failed($reason): ${it.message}")
+        }
+    }
+
+    /** 方案5：把整窗口重画一次，让 PassBlur 重新采集（最重，最后试） */
+    private fun forceWindowRedraw(view: View, reason: String) {
+        runCatching {
+            val root = view.rootView
+            root.invalidate()
+            (root as? ViewGroup)?.requestLayout()
+            diagLog("windowRedraw($reason): root=${root.javaClass.simpleName}")
+        }.onFailure {
+            XposedLog.e(HOOK_TAG, lpparam.packageName, "forceWindowRedraw failed($reason): ${it.message}")
+        }
+    }
+
+    /** 自底向上读一段 MIUI 材质属性，用来对比“我们的视图”和“系统自己的视图” */
+    private fun materialProbe(view: View, label: String): String {
+        val sb = StringBuilder("  material[$label]")
+        var current: View? = view
+        var depth = 0
+        while (current != null && depth < 6) {
+            val cur = current
+            sb.append("\n    ").append(if (depth == 0) "self" else "anc$depth")
+                .append(' ').append(cur.javaClass.simpleName)
+                .append(" blurMode=").append(miInt(cur, "getMiViewBlurMode"))
+                .append(" bgMode=").append(miInt(cur, "getMiBackgroundBlurMode"))
+                .append(" bgRadius=").append(miInt(cur, "getMiBackgroundBlurRadius"))
+                .append(" blurRatio=").append(miFloat(cur, "getMiBackgroundBlurScaleRatio"))
+                .append(" passBlur=").append(miBool(cur, "getPassWindowBlurEnabled"))
+                .append(" selfBlur=").append(miFloat(cur, "getSelfBlurRadius"))
+                .append(" layer=").append(cur.layerType)
+            if (cur is ViewGroup && cur.childCount > 0) sb.append(" children=").append(cur.childCount)
+            current = cur.parent as? View
+            depth++
+        }
+        return sb.toString()
+    }
+
+    private fun findClockOf(view: View): TextView? {
+        val container = view.parent as? ViewGroup ?: return null
+        val clockId = container.resources.getIdentifier(ID_CLOCK, "id", PKG_SYSTEMUI)
+        return if (clockId != 0) container.findViewById(clockId) else null
+    }
+
+    private fun miInt(view: View, name: String): Int? = runCatching { view.callMethod(name) as? Int }.getOrNull()
+
+    private fun miBool(view: View, name: String): Boolean? =
+        runCatching { view.callMethod(name) as? Boolean }.getOrNull()
+
+    private fun miFloat(view: View, name: String): Float? =
+        runCatching { view.callMethod(name) as? Float }.getOrNull()
+
+    private fun miCall(view: View, name: String, vararg args: Any?): Boolean =
+        runCatching { view.callMethod(name, *args) }.isSuccess
 
     // ==================================================================
     // 渲染状态复位
@@ -615,6 +874,8 @@ object BatteryDetailIndicator : BaseHook() {
                 // 动画进行中的时间点只做轻复位，避免和系统的动画抢属性
                 val strong = delay == 0L || delay >= 700L
                 requestRenderReset("$reason+${delay}ms", strong)
+                // 动画应该已经结束了，此时才能试修复（早修会被系统改回去）
+                islandRepair(reason, settle = delay >= 700L)
                 if (delay >= 700L) dumpIcons("$reason+${delay}ms")
             }, delay)
         }
@@ -797,6 +1058,8 @@ object BatteryDetailIndicator : BaseHook() {
     }
 
     private fun updateStatusbarViews(tii: TextIconInfo) {
+        // 灵动岛钩子要等 systemui 插件加载后才能装上（见 ensureIslandEventHooks 注释），这里顺带重试
+        if (!islandHooksInstalled) ensureIslandEventHooks(null)
         // 每 tick 先做一次"卫生"：淘汰失效实例 + 容器内去重，避免多份实例叠加
         pruneTrackedIcons("tick")
         dedupeAll("tick")
