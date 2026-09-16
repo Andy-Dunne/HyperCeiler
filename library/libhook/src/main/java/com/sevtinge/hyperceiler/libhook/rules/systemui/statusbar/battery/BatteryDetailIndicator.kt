@@ -27,9 +27,7 @@ import android.os.HandlerThread
 import android.os.Looper
 import android.os.Message
 import android.os.PowerManager
-import android.os.SystemClock
 import android.text.TextUtils
-import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
@@ -39,7 +37,6 @@ import android.widget.TextView
 import com.sevtinge.hyperceiler.common.log.XposedLog
 import com.sevtinge.hyperceiler.common.utils.PrefsBridge
 import com.sevtinge.hyperceiler.libhook.base.BaseHook
-import com.sevtinge.hyperceiler.libhook.utils.hookapi.blur.MiBlurUtils
 import com.sevtinge.hyperceiler.libhook.utils.api.DisplayUtils.dp2px
 import io.github.lingqiqi5211.ezhooktool.core.callMethod
 import io.github.lingqiqi5211.ezhooktool.core.callStaticMethod
@@ -57,6 +54,9 @@ import java.util.Locale
 import java.util.Properties
 import java.util.concurrent.CopyOnWriteArrayList
 
+/**
+ * Hook rule to display real-time battery detail info (temperature, current, wattage) in status bar.
+ */
 object BatteryDetailIndicator : BaseHook() {
 
     private const val HOOK_TAG = "BatteryDetailIndicator"
@@ -66,51 +66,6 @@ object BatteryDetailIndicator : BaseHook() {
     private const val MSG_DATA_UPDATE = 100021
     private const val MSG_WORKER_TICK = 200021
 
-    private const val DIAG_LOG = false
-
-    private const val DIAG_LOG_TICK = false
-
-    private const val STRONG_RESET_ON_TICK = false
-
-    private const val DIAG_FORCE_OUTPUT = true
-
-    private fun diagLog(msg: String) {
-        if (DIAG_FORCE_OUTPUT) {
-            XposedLog.e(HOOK_TAG, lpparam.packageName, msg)
-        } else {
-            XposedLog.d(HOOK_TAG, lpparam.packageName, msg)
-        }
-    }
-
-    private val RESET_DELAYS = longArrayOf(0L, 120L, 320L, 700L, 1500L)
-
-    private const val SCHEDULE_COOLDOWN_MS = 1000L
-
-    private const val RESET_COOLDOWN_MS = 300L
-
-    private const val VISIBLE_STATE_BURST_LIMIT = 30
-
-    private const val RESET_ON_VISIBLE_STATE = false
-
-    private const val REQUEST_LAYOUT_ON_VISIBLE_STATE = false
-
-    private const val ISLAND_EVENT_COOLDOWN_MS = 800L
-
-    private const val PROBE_LINE_CAP = 60
-
-    private const val DUMP_COOLDOWN_MS = 5000L
-
-    private const val ISLAND_FAST_POLL_MS = 200L
-
-    private const val ISLAND_FAST_POLL_MAX_MS = 30000L
-
-    private const val CLEAR_OWN_BLUR = false
-
-    private const val MIRROR_REFERENCE_MATERIAL = false
-
-    private const val REATTACH_ON_SETTLE = false
-
-    private const val FORCE_WINDOW_REDRAW_ON_SETTLE = false
     private const val TAG_SLOT_TEXT_ICON = "slot_text_icon"
     private const val TAG_NETWORK_SPEED_NUMBER = "network_speed_number"
     private const val TAG_NETWORK_SPEED_UNIT = "network_speed_unit"
@@ -133,16 +88,6 @@ object BatteryDetailIndicator : BaseHook() {
     private const val METHOD_SET_NETWORK_SPEED = "setNetworkSpeed"
     private const val METHOD_IS_CHARGING = "isCharging"
     private const val METHOD_ADD_DARK_RECEIVER = "addDarkReceiver"
-
-    private const val CLS_FOCUS_NOTIF_PROMPT_CONTROLLER = "com.android.systemui.statusbar.phone.FocusedNotifPromptController"
-    private const val CLS_FOCUS_NOTIF_PROMPT_VIEW = "com.android.systemui.statusbar.phone.FocusedNotifPromptView"
-    private const val CLS_MIUI_COLLAPSED_STATUS_BAR = "com.android.systemui.statusbar.phone.MiuiCollapsedStatusBarFragment"
-    private const val CLS_RECENTS_PROXY_NEW = "com.android.systemui.recents.LauncherProxyService"
-    private const val CLS_RECENTS_PROXY_OLD = "com.android.systemui.recents.OverviewProxyService"
-    private const val METHOD_NOTIFY_NOTIF_BEAN_CHANGED = "notifyNotifBeanChanged"
-    private const val METHOD_SET_DATA = "setData"
-    private const val METHOD_UPDATE_STATUS_BAR_VISIBILITIES = "updateStatusBarVisibilities"
-    private const val METHOD_ON_FOCUSED_NOTIF_UPDATE = "onFocusedNotifUpdate"
 
     private const val PKG_SYSTEMUI = "com.android.systemui"
     private const val PROP_POWER_SUPPLY_TEMP = "POWER_SUPPLY_TEMP"
@@ -216,24 +161,13 @@ object BatteryDetailIndicator : BaseHook() {
     private val textIconTagId = getFakeResId("battery_text_icon_tag")
     private val mStatusbarTextIcons = CopyOnWriteArrayList<View>()
 
+    private val lastVisibleStates = java.util.Collections.synchronizedMap(java.util.WeakHashMap<View, Int>())
+    private val lastShowStates = java.util.Collections.synchronizedMap(java.util.WeakHashMap<View, Boolean>())
+
     private var workerThread: HandlerThread? = null
     private var workerHandler: Handler? = null
     private var mainHandler: Handler? = null
 
-    private var resetting = false
-    private var resetCooldownUntil = 0L
-    private var scheduleCooldownUntil = 0L
-    private var burstWindowStart = 0L
-    private var burstCount = 0
-    private var lastBurstStackAt = 0L
-
-    private var islandRootRef: java.lang.ref.WeakReference<View>? = null
-    private var islandWindowTitle: String = ""
-    private var lastIslandVisible = false
-    private var lastIslandEventAt = 0L
-    private var probeLinesLogged = 0
-    private var lastDumpAt = 0L
-    private var islandFastPolling = false
     private data class TextIconInfo(
         var iconShow: Boolean = true,
         var iconText: String = ""
@@ -255,7 +189,6 @@ object BatteryDetailIndicator : BaseHook() {
         }
 
         startDataCollection()
-        setupIslandMonitor()
         setupHotReloadCleanup()
     }
 
@@ -289,22 +222,27 @@ object BatteryDetailIndicator : BaseHook() {
                 if (nsView != null && ViewHelper.isCustomTextIcon(nsView)) {
                     val state = param.args.getOrNull(0) as? Int ?: 0
                     val visible = state != 2
+                    val v = if (visible) View.VISIBLE else View.GONE
+                    if (lastVisibleStates[nsView] == state && nsView.visibility == v) {
+                        return@createBeforeHooks
+                    }
+                    lastVisibleStates[nsView] = state
 
                     val number = nsView.getObjectFieldOrNullAs<TextView>(FIELD_NETWORK_SPEED_NUMBER_TEXT)
                         ?: (nsView as? TextView)
                     val unit = nsView.getObjectFieldOrNullAs<TextView>(FIELD_NETWORK_SPEED_UNIT_TEXT)
 
-                    val v = if (visible) View.VISIBLE else View.GONE
                     number?.visibility = v
                     unit?.visibility = v
                     nsView.visibility = v
-
-                    noteVisibleStateBurst()
-
                     nsView.invalidate()
-                    if (REQUEST_LAYOUT_ON_VISIBLE_STATE) nsView.requestLayout()
 
-                    if (RESET_ON_VISIBLE_STATE) requestRenderReset("setVisibleState")
+                    runCatching {
+                        number?.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+                        number?.invalidate()
+                        number?.setLayerType(View.LAYER_TYPE_NONE, null)
+                        number?.invalidate()
+                    }
                 }
             }
         }.onFailure {
@@ -319,8 +257,6 @@ object BatteryDetailIndicator : BaseHook() {
                 if (nsView != null && ViewHelper.isCustomTextIcon(nsView)) {
                     val lp = nsView.layoutParams ?: LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT)
                     ViewHelper.initStatusbarTextIcon(nsView.context, lp, nsView, false)
-
-                    resetRenderState(nsView, strong = true, reason = "resourcesChanged")
                 }
             }
         }
@@ -333,456 +269,6 @@ object BatteryDetailIndicator : BaseHook() {
                 if (nsView != null && ViewHelper.isCustomTextIcon(nsView)) {
                     syncColorWithClock(nsView)
                 }
-            }
-        }
-    }
-
-    private fun setupIslandMonitor() {
-        hookIslandWindowCreation()
-    }
-
-    private fun hookIslandWindowCreation() {
-        runCatching {
-            val vri = loadClassOrNull("android.view.ViewRootImpl", lpparam.classLoader) ?: return
-            vri.declaredMethods.filter { it.name == "setView" }.createBeforeHooks { param ->
-                runCatching {
-                    val args = param.args
-                    val attrs = args.firstOrNull {
-                        it != null && it.javaClass.name.endsWith("WindowManager.LayoutParams")
-                    }
-                    val title = (runCatching { attrs?.callMethod("getTitle") }.getOrNull()
-                        ?: runCatching { attrs?.getObjectFieldOrNull("title") }.getOrNull())?.toString() ?: ""
-                    val views = args.filterIsInstance<View>()
-                    val root = views.firstOrNull { it.javaClass.name.contains("island", ignoreCase = true) }
-                        ?: views.firstOrNull().takeIf { title.contains("island", ignoreCase = true) }
-                        ?: return@runCatching
-                    islandRootRef = java.lang.ref.WeakReference(root)
-                    islandWindowTitle = title
-                    diagLog("island window attached: $title root=" + root.javaClass.simpleName)
-                }
-            }
-        }.onFailure {
-            XposedLog.e(HOOK_TAG, lpparam.packageName, "hook ViewRootImpl.setView failed: " + it.message)
-        }
-    }
-
-    private fun pollIslandState() {
-        val root = islandRootRef?.get() ?: return
-        if (checkIslandVisible(root) == lastIslandVisible) return
-        lastIslandVisible = !lastIslandVisible
-        onIslandStateChanged(lastIslandVisible)
-        if (lastIslandVisible) startIslandFastPoll()
-    }
-
-    private fun checkIslandVisible(root: View): Boolean =
-        runCatching { root.isShown && root.visibility == View.VISIBLE }.getOrDefault(false)
-
-    private fun startIslandFastPoll() {
-        if (islandFastPolling) return
-        islandFastPolling = true
-        var elapsed = 0L
-        val step = object : Runnable {
-            override fun run() {
-                elapsed += ISLAND_FAST_POLL_MS
-                val root = islandRootRef?.get()
-                val visible = root != null && checkIslandVisible(root)
-                if (visible != lastIslandVisible) {
-                    lastIslandVisible = visible
-                    onIslandStateChanged(visible)
-                }
-                if (elapsed < ISLAND_FAST_POLL_MAX_MS && lastIslandVisible) {
-                    mainHandler?.postDelayed(this, ISLAND_FAST_POLL_MS)
-                } else {
-                    islandFastPolling = false
-                }
-            }
-        }
-        mainHandler?.postDelayed(step, ISLAND_FAST_POLL_MS)
-    }
-
-    private fun onIslandStateChanged(visible: Boolean) {
-        val now = SystemClock.uptimeMillis()
-        if (now - lastIslandEventAt < ISLAND_EVENT_COOLDOWN_MS) return
-        lastIslandEventAt = now
-        val reason = if (visible) "island.show" else "island.hide"
-        if (DIAG_LOG) {
-            diagLog("island state changed: visible=$visible title=$islandWindowTitle")
-            dumpIslandAndOurs()
-        }
-        scheduleRenderReset(reason)
-        islandRepair(reason, settle = true)
-    }
-
-    private fun shownIndicator(): View? = mStatusbarTextIcons.firstOrNull {
-        it.isAttachedToWindow && runCatching { it.isShown }.getOrDefault(false)
-    }
-
-    private fun dumpIslandAndOurs() {
-        if (probeLinesLogged >= PROBE_LINE_CAP) return
-        val ours = shownIndicator() ?: return
-        islandRootRef?.get()?.let { island ->
-            val loc = IntArray(2)
-            runCatching { island.getLocationOnScreen(loc) }
-            diagLog(
-                "  island root=" + island.javaClass.simpleName +
-                    " onScreen=[" + loc[0] + "," + loc[1] + "," + (loc[0] + island.width) + "," + (loc[1] + island.height) + "]" +
-                    " vis=" + island.visibility +
-                    " shown=" + runCatching { island.isShown }.getOrDefault(false)
-            )
-            probeLinesLogged += 2
-            diagLog(materialProbe(island, "island"))
-            probeLinesLogged += 6
-        }
-        diagLog(materialProbe(ours, "ours@" + hostName(ours)))
-        probeLinesLogged += 6
-        findClockOf(ours)?.let {
-            diagLog(materialProbe(it, "clock-ref"))
-            probeLinesLogged += 6
-        }
-    }
-
-    private fun islandRepair(reason: String, settle: Boolean) {
-        if (!settle) return
-        val view = shownIndicator() ?: return
-        if (CLEAR_OWN_BLUR) clearOwnBlur(view, reason)
-        if (MIRROR_REFERENCE_MATERIAL) mirrorReferenceMaterial(view, reason)
-        if (REATTACH_ON_SETTLE) reattachIndicator(view, reason)
-        if (FORCE_WINDOW_REDRAW_ON_SETTLE) forceWindowRedraw(view, reason)
-    }
-
-    private fun clearOwnBlur(view: View, reason: String) {
-        runCatching {
-            MiBlurUtils.clearContainerPassBlur(view)
-            MiBlurUtils.clearMemberBlendColor(view)
-            miCall(view, "removeBackgroundBlurDrawable")
-            miCall(view, "setSelfBlurRadius", 0f)
-        }.onFailure {
-            XposedLog.e(HOOK_TAG, lpparam.packageName, "clearOwnBlur failed(" + reason + "): " + it.message)
-        }
-    }
-
-    private fun mirrorReferenceMaterial(view: View, reason: String) {
-        val clock = findClockOf(view) ?: return
-        val mode = miInt(clock, "getMiViewBlurMode")
-        val bgMode = miInt(clock, "getMiBackgroundBlurMode")
-        val pass = miBool(clock, "getPassWindowBlurEnabled")
-        val color = runCatching { clock.currentTextColor }.getOrDefault(android.graphics.Color.WHITE)
-        miCall(view, "setMiViewBlurMode", mode ?: 0)
-        miCall(view, "setMiBackgroundBlurMode", bgMode ?: 0)
-        miCall(view, "setPassWindowBlurEnabled", pass ?: false)
-        runCatching { MiBlurUtils.setMemberBlendColor(view, false, color) }
-        diagLog("mirror(" + reason + "): clock mode=" + mode + " bgMode=" + bgMode + " pass=" + pass)
-    }
-
-    private fun reattachIndicator(view: View, reason: String) {
-        val parent = view.parent as? ViewGroup ?: return
-        val index = parent.indexOfChild(view)
-        if (index < 0) return
-        val lp = view.layoutParams
-        runCatching {
-            parent.removeView(view)
-            parent.addView(view, index.coerceAtMost(parent.childCount), lp)
-            diagLog("reattach(" + reason + "): host=" + hostName(view))
-        }.onFailure {
-            XposedLog.e(HOOK_TAG, lpparam.packageName, "reattach failed(" + reason + "): " + it.message)
-        }
-    }
-
-    private fun forceWindowRedraw(view: View, reason: String) {
-        runCatching {
-            val root = view.rootView
-            root.invalidate()
-            (root as? ViewGroup)?.requestLayout()
-            diagLog("windowRedraw(" + reason + "): root=" + root.javaClass.simpleName)
-        }.onFailure {
-            XposedLog.e(HOOK_TAG, lpparam.packageName, "forceWindowRedraw failed(" + reason + "): " + it.message)
-        }
-    }
-
-    private fun materialProbe(view: View, label: String): String {
-        val sb = StringBuilder("  material[" + label + "]")
-        var current: View? = view
-        var depth = 0
-        while (current != null && depth < 6) {
-            val cur = current
-            sb.append("\n    ").append(if (depth == 0) "self" else "anc" + depth)
-                .append(' ').append(cur.javaClass.simpleName)
-                .append(" blurMode=").append(miInt(cur, "getMiViewBlurMode"))
-                .append(" bgMode=").append(miInt(cur, "getMiBackgroundBlurMode"))
-                .append(" bgRadius=").append(miInt(cur, "getMiBackgroundBlurRadius"))
-                .append(" blurRatio=").append(miFloat(cur, "getMiBackgroundBlurScaleRatio"))
-                .append(" passBlur=").append(miBool(cur, "getPassWindowBlurEnabled"))
-                .append(" selfBlur=").append(miFloat(cur, "getSelfBlurRadius"))
-                .append(" layer=").append(cur.layerType)
-            if (cur is ViewGroup && cur.childCount > 0) sb.append(" children=").append(cur.childCount)
-            current = cur.parent as? View
-            depth++
-        }
-        return sb.toString()
-    }
-
-    private fun findClockOf(view: View): TextView? {
-        val container = view.parent as? ViewGroup ?: return null
-        val clockId = container.resources.getIdentifier(ID_CLOCK, "id", PKG_SYSTEMUI)
-        return if (clockId != 0) container.findViewById(clockId) else null
-    }
-
-    private fun miInt(view: View, name: String): Int? = runCatching { view.callMethod(name) as? Int }.getOrNull()
-
-    private fun miBool(view: View, name: String): Boolean? =
-        runCatching { view.callMethod(name) as? Boolean }.getOrNull()
-
-    private fun miFloat(view: View, name: String): Float? =
-        runCatching { view.callMethod(name) as? Float }.getOrNull()
-
-    private fun miCall(view: View, name: String, vararg args: Any?): Boolean =
-        runCatching { view.callMethod(name, *args) }.isSuccess
-
-    private fun resetRenderState(view: View, strong: Boolean, reason: String) {
-        runCatching {
-            view.setLayerType(View.LAYER_TYPE_NONE, null)
-            view.alpha = 1f
-            view.scaleX = 1f
-            view.scaleY = 1f
-            view.translationX = 0f
-            view.translationY = 0f
-            view.invalidate()
-
-            val number = view.getObjectFieldOrNullAs<TextView>(FIELD_NETWORK_SPEED_NUMBER_TEXT) ?: (view as? TextView)
-            if (number != null) {
-                number.setLayerType(View.LAYER_TYPE_NONE, null)
-                number.alpha = 1f
-                number.scaleX = 1f
-                number.scaleY = 1f
-                number.translationX = 0f
-                number.translationY = 0f
-                if (strong) {
-
-                    number.setLayerType(View.LAYER_TYPE_HARDWARE, null)
-                    number.invalidate()
-                    number.setLayerType(View.LAYER_TYPE_NONE, null)
-                }
-                number.invalidate()
-            }
-
-            if (strong) {
-                var parent: View? = view.parent as? View
-                var depth = 0
-                while (parent != null && depth < 3) {
-                    parent.invalidate()
-                    parent = parent.parent as? View
-                    depth++
-                }
-            }
-        }.onFailure {
-            XposedLog.e(HOOK_TAG, lpparam.packageName, "resetRenderState failed($reason): ${it.message}")
-        }
-
-    }
-
-    private fun resetAllIcons(reason: String, strong: Boolean) {
-        pruneTrackedIcons(reason)
-        var skipped = 0
-        val summary = StringBuilder()
-        for (view in mStatusbarTextIcons) {
-            if (!view.isAttachedToWindow) {
-                skipped++
-                continue
-            }
-            resetRenderState(view, strong, reason)
-            if (DIAG_LOG) summary.append(resetSummaryLine(view))
-        }
-        if (DIAG_LOG && (summary.isNotEmpty() || skipped > 0)) {
-            diagLog(
-                "reset($reason,strong=$strong) attached=${mStatusbarTextIcons.size - skipped} " +
-                    "skipped=$skipped$summary"
-            )
-        }
-    }
-
-    private fun resetSummaryLine(view: View): String {
-        val number = view.getObjectFieldOrNullAs<TextView>(FIELD_NETWORK_SPEED_NUMBER_TEXT) ?: (view as? TextView)
-        val tv = if (number != null) {
-            " tv[layer=${number.layerType},alpha=${number.alpha},scale=${number.scaleX},${number.scaleY},trans=${number.translationX},${number.translationY}]"
-        } else {
-            ""
-        }
-        return "\n    ${hostName(view)}[vis=${view.visibility},shown=${runCatching { view.isShown }.getOrDefault(false)}" +
-            ",layer=${view.layerType},alpha=${view.alpha},scale=${view.scaleX},${view.scaleY}" +
-            ",trans=${view.translationX},${view.translationY}]$tv"
-    }
-
-    private fun requestRenderReset(reason: String, strong: Boolean = true) {
-        if (resetting) return
-        val now = SystemClock.uptimeMillis()
-        if (now < resetCooldownUntil) return
-        resetCooldownUntil = now + RESET_COOLDOWN_MS
-        resetting = true
-        try {
-            resetAllIcons(reason, strong)
-        } finally {
-            resetting = false
-        }
-    }
-
-    private fun noteVisibleStateBurst() {
-        val now = SystemClock.uptimeMillis()
-        if (now - burstWindowStart > 1000L) {
-            burstWindowStart = now
-            burstCount = 0
-        }
-        burstCount++
-        if (burstCount == VISIBLE_STATE_BURST_LIMIT) {
-            diagLog("!! setVisibleState 调用频率 > $VISIBLE_STATE_BURST_LIMIT 次/秒（疑似回调自激），已停止在该入口做复位")
-        }
-        if (burstCount >= VISIBLE_STATE_BURST_LIMIT && now - lastBurstStackAt > 5000L) {
-            lastBurstStackAt = now
-            val frames = Log.getStackTraceString(Throwable()).split('\n').take(16).joinToString("\n")
-            diagLog("---- setVisibleState 调用栈（截断 16 帧）----\n$frames")
-        }
-    }
-
-    private fun scheduleRenderReset(reason: String) {
-        val now = SystemClock.uptimeMillis()
-        if (resetting || now < scheduleCooldownUntil) return
-        scheduleCooldownUntil = now + SCHEDULE_COOLDOWN_MS
-        val handler = mainHandler
-        if (handler == null) {
-            requestRenderReset("$reason:sync")
-            return
-        }
-        for (delay in RESET_DELAYS) {
-            handler.postDelayed({
-
-                val strong = delay == 0L || delay >= 700L
-                requestRenderReset("$reason+${delay}ms", strong)
-
-                islandRepair(reason, settle = delay >= 700L)
-                if (delay >= 700L) dumpIcons("$reason+${delay}ms")
-            }, delay)
-        }
-    }
-
-    private fun pruneTrackedIcons(reason: String) {
-        if (mStatusbarTextIcons.isEmpty()) return
-        var removed = 0
-        for (view in mStatusbarTextIcons) {
-            if (view.parent == null && mStatusbarTextIcons.remove(view)) {
-                removed++
-            }
-        }
-        if (DIAG_LOG && removed > 0) {
-            diagLog("prune($reason) removed=$removed left=${mStatusbarTextIcons.size}")
-        }
-    }
-
-    private fun dedupeInContainer(container: ViewGroup, keep: View?, reason: String) {
-        if (container.childCount <= 1) return
-        val duplicates = ArrayList<View>()
-        for (i in 0 until container.childCount) {
-            val child = container.getChildAt(i)
-            if (child !== keep && ViewHelper.isCustomTextIcon(child)) {
-                duplicates.add(child)
-            }
-        }
-        if (duplicates.isEmpty()) return
-        for (child in duplicates) {
-
-            val snapshot = if (DIAG_LOG) describeView(child) else null
-            runCatching { container.removeView(child) }
-            mStatusbarTextIcons.remove(child)
-            if (snapshot != null) {
-                diagLog("dedupe($reason) removed duplicate: $snapshot")
-            }
-        }
-    }
-
-    private fun dedupeAll(reason: String) {
-        for (view in mStatusbarTextIcons) {
-            if (!view.isAttachedToWindow) continue
-            val parent = view.parent as? ViewGroup ?: continue
-            dedupeInContainer(parent, view, reason)
-        }
-    }
-
-    private fun dumpIcons(reason: String) {
-        val now = SystemClock.uptimeMillis()
-        if (now - lastDumpAt < DUMP_COOLDOWN_MS) return
-        lastDumpAt = now
-        if (!DIAG_LOG) return
-        val tracked = mStatusbarTextIcons.size
-        val attached = mStatusbarTextIcons.count { it.isAttachedToWindow }
-        diagLog("==== dump[$reason] tracked=$tracked attached=$attached ====")
-        for (view in mStatusbarTextIcons) {
-            diagLog("  tracked: ${describeView(view)}")
-        }
-        val root = mStatusbarTextIcons.firstOrNull { it.isAttachedToWindow }?.rootView
-        if (root != null) {
-            val found = ArrayList<View>()
-            collectTaggedIcons(root, found)
-            diagLog("  taggedInRoot=${found.size} root=${root.javaClass.name}")
-            found.forEachIndexed { index, view ->
-                diagLog("    #$index ${describeView(view)}")
-            }
-        }
-        diagLog("==== dump end[$reason] ====")
-    }
-
-    private fun describeView(view: View): String = buildString {
-        append("cls=").append(view.javaClass.simpleName)
-        append('@').append(java.lang.Integer.toHexString(java.lang.System.identityHashCode(view)))
-        append(" vis=").append(view.visibility)
-        append(" attached=").append(view.isAttachedToWindow)
-        append(" shown=").append(runCatching { view.isShown }.getOrDefault(false))
-        append(" layer=").append(view.layerType)
-        append(" alpha=").append(view.alpha)
-        append(" scale=").append(view.scaleX).append(',').append(view.scaleY)
-        append(" trans=").append(view.translationX).append(',').append(view.translationY)
-        append(" bounds=[").append(view.left).append(',').append(view.top).append(',')
-        append(view.right).append(',').append(view.bottom).append(']')
-        append(" size=").append(view.width).append('x').append(view.height)
-        append(" host=").append(hostName(view))
-        append(" parent=").append(parentChain(view))
-        append(' ').append(miuiBlurState(view))
-    }
-
-    private fun parentChain(view: View, depth: Int = 4): String {
-        val sb = StringBuilder()
-        var current: View? = view.parent as? View
-        var level = 0
-        while (current != null && level < depth) {
-            if (level > 0) sb.append(" < ")
-            sb.append(current.javaClass.simpleName)
-            current = current.parent as? View
-            level++
-        }
-        return sb.toString()
-    }
-
-    private fun hostName(view: View): String {
-        var current: View? = view.parent as? View
-        var last = view.javaClass.simpleName
-        var level = 0
-        while (current != null && level < 10) {
-            last = current.javaClass.simpleName
-            current = current.parent as? View
-            level++
-        }
-        return last
-    }
-
-    private fun miuiBlurState(view: View): String {
-        val viewMode = runCatching { view.callMethod("getMiViewBlurMode") as? Int }.getOrNull()
-        val bgMode = runCatching { view.callMethod("getMiBackgroundBlurMode") as? Int }.getOrNull()
-        val passWindow = runCatching { view.callMethod("getPassWindowBlurEnabled") as? Boolean }.getOrNull()
-        return "miBlur(viewMode=$viewMode,bgMode=$bgMode,passWindow=$passWindow)"
-    }
-
-    private fun collectTaggedIcons(view: View, out: MutableList<View>) {
-        if (ViewHelper.isCustomTextIcon(view)) out.add(view)
-        if (view is ViewGroup) {
-            for (i in 0 until view.childCount) {
-                collectTaggedIcons(view.getChildAt(i), out)
             }
         }
     }
@@ -823,31 +309,25 @@ object BatteryDetailIndicator : BaseHook() {
     }
 
     private fun updateStatusbarViews(tii: TextIconInfo) {
-
-        pollIslandState()
-
-        pruneTrackedIcons("tick")
-        dedupeAll("tick")
-
         for (tv in mStatusbarTextIcons) {
-            runCatching { tv.callMethod(METHOD_SET_VISIBILITY_BY_CONTROLLER, tii.iconShow) }
-                .onFailure { tv.visibility = if (tii.iconShow) View.VISIBLE else View.GONE }
-            if (tii.iconShow) {
+            if (lastShowStates[tv] != tii.iconShow) {
+                lastShowStates[tv] = tii.iconShow
+                runCatching { tv.callMethod(METHOD_SET_VISIBILITY_BY_CONTROLLER, tii.iconShow) }
+                    .onFailure { tv.visibility = if (tii.iconShow) View.VISIBLE else View.GONE }
+            }
+            if (!tii.iconShow) {
+                continue
+            }
+            val number = tv.getObjectFieldOrNullAs<TextView>(FIELD_NETWORK_SPEED_NUMBER_TEXT)
+                ?: (tv as? TextView)
+            if (number?.text?.toString() != tii.iconText) {
                 runCatching { tv.callMethod(METHOD_SET_NETWORK_SPEED, tii.iconText, "") }
                     .onFailure {
-                        val number = tv.getObjectFieldOrNullAs<TextView>(FIELD_NETWORK_SPEED_NUMBER_TEXT)
-                            ?: (tv as? TextView)
                         number?.text = tii.iconText
                     }
-                syncColorWithClock(tv)
             }
-
-            if (tv.isAttachedToWindow) {
-                resetRenderState(tv, strong = STRONG_RESET_ON_TICK, reason = "tick")
-            }
+            syncColorWithClock(tv)
         }
-
-        if (DIAG_LOG_TICK) dumpIcons("tick")
     }
 
     private object RightSideHookHelper {
@@ -971,18 +451,14 @@ object BatteryDetailIndicator : BaseHook() {
                 if (!mStatusbarTextIcons.contains(existing)) {
                     mStatusbarTextIcons.add(existing)
                 }
-
-                dedupeInContainer(mGroup, existing, "right.existing")
                 param.result = existing
             } else {
                 val iconView = ViewHelper.createStatusbarTextIcon(nsvCls, mContext, lp, true)
                 val index = (param.args[0] as? Int ?: 0).coerceAtLeast(0).coerceAtMost(mGroup.childCount)
                 mGroup.addView(iconView, index)
                 mStatusbarTextIcons.add(iconView)
-                dedupeInContainer(mGroup, iconView, "right.new")
                 param.result = iconView
             }
-            if (DIAG_LOG) dumpIcons("right.addHolder")
         }
     }
 
@@ -994,7 +470,7 @@ object BatteryDetailIndicator : BaseHook() {
         }
 
         private fun setupCollapsedStatusBar(nsvCls: Class<*>) {
-            val mcsbFragmentCls = loadClassOrNull(CLS_MIUI_COLLAPSED_STATUS_BAR, lpparam.classLoader)
+            val mcsbFragmentCls = loadClassOrNull("com.android.systemui.statusbar.phone.MiuiCollapsedStatusBarFragment", lpparam.classLoader)
                 ?: loadClassOrNull("com.android.systemui.statusbar.phone.CollapsedStatusBarFragment", lpparam.classLoader)
                 ?: return
 
@@ -1091,17 +567,12 @@ object BatteryDetailIndicator : BaseHook() {
             providedDarkDispatcher: Any?
         ) {
             val container = targetContainer ?: (clockView?.parent as? ViewGroup) ?: return
-            pruneTrackedIcons("inject")
             val existing = container.findViewWithTag<View>(TAG_SLOT_TEXT_ICON)
             if (existing != null) {
                 if (!mStatusbarTextIcons.contains(existing)) {
                     mStatusbarTextIcons.add(existing)
                 }
-
-                dedupeInContainer(container, existing, "left.existing")
                 syncColorWithClock(existing, clockView as? TextView)
-                resetRenderState(existing, strong = true, reason = "inject.existing")
-                if (DIAG_LOG) dumpIcons("left.inject.existing")
                 return
             }
 
@@ -1120,17 +591,14 @@ object BatteryDetailIndicator : BaseHook() {
             }
             container.addView(iconView, index)
             mStatusbarTextIcons.add(iconView)
-            dedupeInContainer(container, iconView, "left.new")
             syncColorWithClock(iconView, clockView as? TextView)
             if (darkDispatcher != null) {
                 runCatching { darkDispatcher.callMethod(METHOD_ADD_DARK_RECEIVER, iconView) }
             }
-            resetRenderState(iconView, strong = true, reason = "inject.new")
-            if (DIAG_LOG) dumpIcons("left.inject.new")
         }
 
         private fun setupSystemIconAreaVisibility() {
-            val mcsbFragmentCls = loadClassOrNull(CLS_MIUI_COLLAPSED_STATUS_BAR, lpparam.classLoader)
+            val mcsbFragmentCls = loadClassOrNull("com.android.systemui.statusbar.phone.MiuiCollapsedStatusBarFragment", lpparam.classLoader)
                 ?: loadClassOrNull("com.android.systemui.statusbar.phone.CollapsedStatusBarFragment", lpparam.classLoader)
                 ?: return
 
@@ -1140,8 +608,6 @@ object BatteryDetailIndicator : BaseHook() {
                         runCatching { v.callMethod(METHOD_SET_VISIBILITY_BY_CONTROLLER, true) }
                             .onFailure { v.visibility = View.VISIBLE }
                     }
-
-                    scheduleRenderReset("showSystemIconArea")
                 }
             }
 
@@ -1151,7 +617,6 @@ object BatteryDetailIndicator : BaseHook() {
                         runCatching { v.callMethod(METHOD_SET_VISIBILITY_BY_CONTROLLER, false) }
                             .onFailure { v.visibility = View.GONE }
                     }
-                    scheduleRenderReset("hideSystemIconArea")
                 }
             }
         }
@@ -1371,10 +836,8 @@ object BatteryDetailIndicator : BaseHook() {
 
             iconTextView.setPaddingRelative(leftMarginPx, topMarginPx, rightMarginPx, 0)
 
-            if (fixedWidth > 10) {
-                lp.width = dp2px(fixedWidth.toFloat())
-                iconView.layoutParams = lp
-            }
+            lp.width = if (fixedWidth > 10) dp2px(fixedWidth.toFloat()) else worstCaseWidth(iconTextView)
+            iconView.layoutParams = lp
 
             when (align) {
                 2 -> iconTextView.gravity = Gravity.START or Gravity.CENTER_VERTICAL
@@ -1382,6 +845,27 @@ object BatteryDetailIndicator : BaseHook() {
                 4 -> iconTextView.gravity = Gravity.END or Gravity.CENTER_VERTICAL
                 else -> iconTextView.gravity = Gravity.START or Gravity.CENTER_VERTICAL
             }
+        }
+
+        private fun worstCaseWidth(tv: TextView): Int {
+            val temp = "-88.8$UNIT_CELSIUS"
+            val curr = "-999$UNIT_MA"
+            val watt = "188.88$UNIT_WATT"
+            val parts = when (content) {
+                1 -> if (reverseOrder) listOf(curr, temp) else listOf(temp, curr)
+                2 -> listOf(watt)
+                3 -> listOf(curr)
+                4 -> if (reverseOrder) listOf(watt, temp) else listOf(temp, watt)
+                else -> listOf(curr, watt)
+            }
+            val paint = tv.paint
+            val measured = if (isMultiLineContent(content) && !singleRow) {
+                parts.maxOf { paint.measureText(it) }
+            } else {
+                paint.measureText(parts.joinToString(" "))
+            }
+            val textWidth = measured.toInt() + 2
+            return maxOf(textWidth + tv.paddingLeft + tv.paddingRight, tv.minimumWidth)
         }
 
         private fun isMultiLineContent(contentMode: Int): Boolean {
