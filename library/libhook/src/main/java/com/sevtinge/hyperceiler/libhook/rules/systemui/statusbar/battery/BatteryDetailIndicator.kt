@@ -213,22 +213,27 @@ object BatteryDetailIndicator : BaseHook() {
             XposedLog.e(HOOK_TAG, lpparam.packageName, "Failed to hook NetworkSpeedView.getSlot: ${it.message}")
         }
 
-         runCatching {
-            nsvCls.declaredMethods
-            .filter { it.name == "setVisibleState" }
-            .createAfterHooks { param ->
-                val nsView = param.thisObject as? View ?: return@createAfterHooks
-                if (!ViewHelper.isCustomTextIcon(nsView)) return@createAfterHooks
-                val state = param.args.getOrNull(0) as? Int ?: 0
-                val visible = state != 2
-                val number = nsView.getObjectFieldOrNullAs<TextView>(FIELD_NETWORK_SPEED_NUMBER_TEXT)
-                       ?: (nsView as? TextView)
-                number?.visibility = if (visible) View.VISIBLE else View.GONE
+        runCatching {
+            nsvCls.declaredMethods.filter { it.name == "setVisibleState" }.createBeforeHooks { param ->
+                val nsView = param.thisObject as? View
+                if (nsView != null && ViewHelper.isCustomTextIcon(nsView)) {
+                    val state = param.args.getOrNull(0) as? Int ?: 0
+                    val visible = state != 2
 
-                // Keyguard/lockscreen tends to rely on layout/paint refresh after visibility changes.
-                nsView.requestLayout()
-                nsView.invalidate()            
-               }
+                    val number = nsView.getObjectFieldOrNullAs<TextView>(FIELD_NETWORK_SPEED_NUMBER_TEXT)
+                        ?: (nsView as? TextView)
+                    val unit = nsView.getObjectFieldOrNullAs<TextView>(FIELD_NETWORK_SPEED_UNIT_TEXT)
+
+                    val v = if (visible) View.VISIBLE else View.GONE
+                    number?.visibility = v
+                    unit?.visibility = v
+                    nsView.visibility = v
+
+                    // 锁屏/动画场景下，强制刷新排版/line box，避免“模糊/错位残影”
+                    nsView.invalidate()
+                    nsView.requestLayout()
+                }
+            }
         }.onFailure {
             XposedLog.e(HOOK_TAG, lpparam.packageName, "Failed to hook NetworkSpeedView.setVisibleState: ${it.message}")
         }
@@ -400,7 +405,7 @@ object BatteryDetailIndicator : BaseHook() {
 
         private fun setupIconManager(nsvCls: Class<*>) {
             val iconManagerCls = loadClassOrNull("com.android.systemui.statusbar.phone.ui.IconManager", lpparam.classLoader)
-                ?: loadClassOrNull("com.android.systemui.statusbar.phone.StatusBarIconController\$IconManager", lpparam.classLoader)
+                ?: loadClassOrNull("com.android.systemui.statusbar.phone.ui.IconManager", lpparam.classLoader)
                 ?: return
 
             runCatching {
@@ -768,10 +773,6 @@ object BatteryDetailIndicator : BaseHook() {
             return iconView
         }
 
-        private fun isMultiLineContent(contentMode: Int): Boolean {
-            return contentMode == 1 || contentMode == 4 || contentMode == 5
-        }
-
         @SuppressLint("DiscouragedApi")
         fun initStatusbarTextIcon(
             mContext: Context,
@@ -829,6 +830,10 @@ object BatteryDetailIndicator : BaseHook() {
                 4 -> iconTextView.gravity = Gravity.END or Gravity.CENTER_VERTICAL
                 else -> iconTextView.gravity = Gravity.START or Gravity.CENTER_VERTICAL
             }
+        }
+
+        private fun isMultiLineContent(contentMode: Int): Boolean {
+            return contentMode == 1 || contentMode == 4 || contentMode == 5
         }
     }
 }
