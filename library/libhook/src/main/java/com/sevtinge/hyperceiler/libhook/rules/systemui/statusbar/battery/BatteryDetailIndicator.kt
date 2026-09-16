@@ -40,7 +40,6 @@ import com.sevtinge.hyperceiler.common.log.XposedLog
 import com.sevtinge.hyperceiler.common.utils.PrefsBridge
 import com.sevtinge.hyperceiler.libhook.base.BaseHook
 import com.sevtinge.hyperceiler.libhook.utils.hookapi.blur.MiBlurUtils
-import com.sevtinge.hyperceiler.libhook.utils.api.DeviceHelper.System.isMoreAndroidVersion
 import com.sevtinge.hyperceiler.libhook.utils.api.DisplayUtils.dp2px
 import io.github.lingqiqi5211.ezhooktool.core.callMethod
 import io.github.lingqiqi5211.ezhooktool.core.callStaticMethod
@@ -58,40 +57,6 @@ import java.util.Locale
 import java.util.Properties
 import java.util.concurrent.CopyOnWriteArrayList
 
-/**
- * Hook rule to display real-time battery detail info (temperature, current, wattage) in status bar.
- *
- * 本次改动（只动"状态归属"，不改绘制外观）：
- *
- * 1. 渲染状态复位从 setVisibleState 里抽成 resetRenderState()，并挂到灵动岛（焦点通知）的
- *    各个事件入口 + 每次 tick 兜底。原来的复位只挂在 setVisibleState 上，而灵动岛走的不是
- *    那条链路，所以第二个岛通知（如充电动画）插进来时残留的状态永远不会被清掉 -> 必糊。
- *
- * 2. 实例唯一化：注入时同容器内去重，tick 时淘汰已经脱离视图树的实例。灵动岛切换期间状态栏
- *    布局可能被重建/重新插入，两份指示器叠在一起看起来就是"糊/重影"。
- *
- * 3. 诊断日志（DIAG_LOG）：打印实例数、attached 状态、layer/alpha/scale/translation、父链、
- *    坐标，以及只读的 MIUI 材质状态和目标 View 树里带标记的节点数，用来判定故障属于
- *    "多实例 / 动画中间态 / 遮挡材质" 中的哪一类。修好后把 DIAG_LOG 改成 false 即可。
- *
- * 第二轮改动（基于第一份 LSPosed 日志的分析结论）：
- *
- * 4. 修掉自激死循环：原实现在 setVisibleState 里“同步复位 + 挂 5 个延时复位”，
- *    实测与系统回调互相激发，达到 ~165 次/秒、7 秒打印 4.5 万行日志（LSPosed 日志环形缓冲被刷掉 4 次），
- *    并反复重启系统图标动画，表现就是指示器“鬼畜左右跳”。现在：
- *      - setVisibleState 里默认不再复位（RESET_ON_VISIBLE_STATE）、不再 requestLayout（REQUEST_LAYOUT_ON_VISIBLE_STATE）；
- *      - 复位入口 requestRenderReset() 做了重入保护和 300ms 冷却，批次合并 500ms；
- *      - 增加频率监控 noteVisibleStateBurst()，超阀值会打一次调用栈（用来找出真正的高频来源）。
- *
- * 5. 日志结论：所有采样里 layer=0 / alpha=1.0 / scale=1,1 / trans=0,0，即“渲染状态停在中间态”
- *    这个假设基本被排除；“糊”更可能是遮挡/几何/多份实例叠加。因此灵动岛事件现在会额外打印
- *    岛视图和指示器的屏幕矩形及是否重叠（onIslandEvent），下一轮日志就能直接定性。
- *
- * 关于日志：HyperCeiler 的日志级别有个坑——release 变体下 LogLevelManager.getEffectiveLogLevel()
- * 会把「详细日志」强制降级成「一般日志」，此时 XposedLog.d / w / i 全部不会输出，只有 XposedLog.e 能出来。
- * 所以诊断输出统一走 diagLog()，默认（DIAG_FORCE_OUTPUT = true）使用 e 通道，
- * 无论 release 还是 debug 包，只要日志等级不是「禁用日志输出」就能看到。
- */
 object BatteryDetailIndicator : BaseHook() {
 
     private const val HOOK_TAG = "BatteryDetailIndicator"
@@ -101,34 +66,14 @@ object BatteryDetailIndicator : BaseHook() {
     private const val MSG_DATA_UPDATE = 100021
     private const val MSG_WORKER_TICK = 200021
 
-    // ------------------------------------------------------------------ 调试开关
-
-    /** 事件级诊断日志（灵动岛事件、注入、tick 复位）。定位期间保持 true，修好后改 false。 */
     private const val DIAG_LOG = true
 
-    /** 每 tick 都 dump 一次会刷屏，默认关。需要连续曲线数据时再打开。 */
     private const val DIAG_LOG_TICK = false
 
-    /**
-     * tick（每 2 秒）的兜底复位是否也做"强化版"（HARDWARE -> NONE 强制重栅格化 + 逐级 invalidate）。
-     * 定位阶段建议设成 true：这样"事件复位漏掉的那一次"最多 2 秒就会被强行清掉，
-     * 如果此时糊掉会在 2 秒内自愈，就直接证明原因是"渲染状态停在中间态"；
-     * 如果 2 秒后依然糊，则原因是多实例或遮挡，需要看 dump 日志里的实例数与坐标。
-     */
     private const val STRONG_RESET_ON_TICK = false
 
-    /**
-     * 诊断输出是否走“一定看得见”的通道。
-     *
-     * true  -> 用 XposedLog.e（日志等级 ≥ 一般日志即可见，release 包也能看到）
-     * false -> 用 XposedLog.d（仅 debug 包 + 「详细日志」可见）
-     *
-     * 因为 release 变体会把「详细日志」降级成「一般日志」，定位阶段请保持 true，
-     * 否则你会看到日志里什么都没有，误以为代码没生效。
-     */
     private const val DIAG_FORCE_OUTPUT = true
 
-    /** 诊断日志统一出口，见 DIAG_FORCE_OUTPUT 说明 */
     private fun diagLog(msg: String) {
         if (DIAG_FORCE_OUTPUT) {
             XposedLog.e(HOOK_TAG, lpparam.packageName, msg)
@@ -137,46 +82,18 @@ object BatteryDetailIndicator : BaseHook() {
         }
     }
 
-    /**
-     * 灵动岛动画时长不确定，事件发生后在若干时间点补做复位：
-     * - 0ms：立刻清掉上一轮事件可能留下的陈旧状态
-     * - 120/320ms：动画进行中，只做"轻复位"，不和系统的动画抢属性
-     * - 700/1500ms：动画应当已经结束，做"强复位"（含强制重栅格化）并抓一次现场
-     */
     private val RESET_DELAYS = longArrayOf(0L, 120L, 320L, 700L, 1500L)
 
-    /**
-     * 复位批次的合并冷却时间。
-     * 实测（LSPosed 日志）setVisibleState 在高频回调时会和复位互相激发：7 秒内打出 4.5 万行日志，
-     * LSPosed 日志环形缓冲被刷掉 4 次，同时系统图标进出场动画被反复重启 -> 指示器鬼畜左右跳。
-     */
     private const val SCHEDULE_COOLDOWN_MS = 500L
 
-    /** 单次复位的最小间隔，防止“复位 -> 触发系统回调 -> 再复位”自激 */
     private const val RESET_COOLDOWN_MS = 300L
 
-    /** setVisibleState 每秒调用次数超过该值判定为疑似自激/死循环，并打一次调用栈 */
     private const val VISIBLE_STATE_BURST_LIMIT = 30
 
-    /**
-     * 是否还在 setVisibleState 里做复位。
-     * 日志实测结论：这个入口不是“糊”的原因（所有采样里 layer/alpha/scale/trans 全是干净值），
-     * 但它调用频率极高，在这里复位只会制造自激。默认关掉做对比实验时再打。
-     */
     private const val RESET_ON_VISIBLE_STATE = false
 
-    /**
-     * 是否在 setVisibleState 里手动 requestLayout。
-     * 请求布局会诱发下一轮 setVisibleState 回调，是指示器“鬼畜左右跳”的高度嫌疑人，默认关。
-     */
     private const val REQUEST_LAYOUT_ON_VISIBLE_STATE = false
 
-    // ================= 灵动岛（HyperOS4） =================
-
-    /**
-     * 灵动岛候选类名。日志实测：HyperOS4 的实现对在 `miui.systemui.dynamicisland.**`
-     * （且位于 systemui 插件里，要在插件加载后才能 load），老版本的名字放在后面兼容。
-     */
     private val ISLAND_CLASS_CANDIDATES = listOf(
         "miui.systemui.dynamicisland.view.DynamicIslandBigIslandView",
         "miui.systemui.dynamicisland.view.DynamicIslandWindowViewImpl",
@@ -189,7 +106,7 @@ object BatteryDetailIndicator : BaseHook() {
         "miui.systemui.dynamicisland.DynamicIslandEventCoordinator",
         "miui.systemui.dynamicisland.IslandTransitionExecutor",
         "miui.systemui.dynamicisland.DynamicIslandAnimationDelegateHelper",
-        // 老版本（HyperOS2/3）名字，仅当兼容
+
         "com.android.systemui.statusbar.phone.FocusedNotifPromptController",
         "com.android.systemui.statusbar.phone.FocusedNotifPromptView",
         "com.android.systemui.statusbar.phone.MiuiCollapsedStatusBarFragment",
@@ -199,21 +116,14 @@ object BatteryDetailIndicator : BaseHook() {
 
     private const val ISLAND_HOOK_MAX_ATTEMPTS = 30
 
-    /** 是否对比“我们的视图”与“系统自己视图（状态栏时钟）”的 MIUI 材质属性 */
     private const val PROBE_MATERIAL = true
 
-    // ---- 三个候选修复，默认全关，一次只开一个试 ----
-
-    /** 方案1：每轮岛事件后把指示器自身的模糊/混合属性全部清掉 */
     private const val CLEAR_OWN_BLUR = false
 
-    /** 方案2：按参考视图（状态栏时钟）把材质配置镜像到指示器 */
     private const val MIRROR_REFERENCE_MATERIAL = false
 
-    /** 方案3：把指示器从父容器摘下来再挂回去，强制重新采集纹理 */
     private const val REATTACH_ON_SETTLE = false
 
-    /** 方案4：整个窗口重画（最重，最后试） */
     private const val FORCE_WINDOW_REDRAW_ON_SETTLE = false
 
     private const val TAG_SLOT_TEXT_ICON = "slot_text_icon"
@@ -239,7 +149,6 @@ object BatteryDetailIndicator : BaseHook() {
     private const val METHOD_IS_CHARGING = "isCharging"
     private const val METHOD_ADD_DARK_RECEIVER = "addDarkReceiver"
 
-    // 灵动岛（焦点通知）相关入口
     private const val CLS_FOCUS_NOTIF_PROMPT_CONTROLLER = "com.android.systemui.statusbar.phone.FocusedNotifPromptController"
     private const val CLS_FOCUS_NOTIF_PROMPT_VIEW = "com.android.systemui.statusbar.phone.FocusedNotifPromptView"
     private const val CLS_MIUI_COLLAPSED_STATUS_BAR = "com.android.systemui.statusbar.phone.MiuiCollapsedStatusBarFragment"
@@ -326,7 +235,6 @@ object BatteryDetailIndicator : BaseHook() {
     private var workerHandler: Handler? = null
     private var mainHandler: Handler? = null
 
-    // ---- 防自激 / 频率监控 ----
     private var resetting = false
     private var resetCooldownUntil = 0L
     private var scheduleCooldownUntil = 0L
@@ -334,12 +242,11 @@ object BatteryDetailIndicator : BaseHook() {
     private var burstCount = 0
     private var lastBurstStackAt = 0L
 
-    // ---- 灵动岛 ----
     private var islandHooksInstalled = false
     private var islandHookAttempts = 0
     private var pluginLoadHookInstalled = false
     private val islandClassCache = java.util.concurrent.ConcurrentHashMap<Class<*>, Boolean>()
-    private val loggedIslandEvents: MutableSet<String> = java.util.Collections.synchronizedSet(HashSet())
+    private val loggedIslandEvents: MutableSet<String> = java.util.Collections.synchronizedSet(HashSet<String>())
 
     private data class TextIconInfo(
         var iconShow: Boolean = true,
@@ -411,9 +318,6 @@ object BatteryDetailIndicator : BaseHook() {
                     nsView.invalidate()
                     if (REQUEST_LAYOUT_ON_VISIBLE_STATE) nsView.requestLayout()
 
-                    // 注意：这里默认不做复位（见 RESET_ON_VISIBLE_STATE 注释）。
-                    // 原实现在这里同步复位 + 挂 5 个延时复位，实测会与 setVisibleState 互相激发，
-                    // 形成 ~165 次/秒的回调死循环，日志刷爆、指示器左右跳。
                     if (RESET_ON_VISIBLE_STATE) requestRenderReset("setVisibleState")
                 }
             }
@@ -429,7 +333,7 @@ object BatteryDetailIndicator : BaseHook() {
                 if (nsView != null && ViewHelper.isCustomTextIcon(nsView)) {
                     val lp = nsView.layoutParams ?: LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT)
                     ViewHelper.initStatusbarTextIcon(nsView.context, lp, nsView, false)
-                    // 字体/主题/密度变化会重建绘制资源，顺手把渲染状态拉回中性
+
                     resetRenderState(nsView, strong = true, reason = "resourcesChanged")
                 }
             }
@@ -447,38 +351,12 @@ object BatteryDetailIndicator : BaseHook() {
         }
     }
 
-    // ==================================================================
-    // 灵动岛（焦点通知）事件 -> 主动复位
-    // ==================================================================
-
-    /**
-     * 灵动岛是唯一会重排状态栏几何、切换整片可见性、并且会播放"会被第二个通知打断的动画"的流程。
-     * 指示器是系统不认识的编外 View，系统收尾动画时不会照顾它，所以每个岛事件之后都要复位一次。
-     *
-     * 这里挂的入口和 HideFakeStatusBar.kt 里已经验证过的一致：
-     * - FocusedNotifPromptController.notifyNotifBeanChanged：焦点通知内容更新（例如音乐 -> 充电）
-     * - FocusedNotifPromptView.setData：岛的数据刷新（会重播动画）
-     * - MiuiCollapsedStatusBarFragment.updateStatusBarVisibilities：整片可见性状态机
-     * - LauncherProxyService / OverviewProxyService.onFocusedNotifUpdate：岛动画的目标矩形（几何重排）
-     */
     private fun setupIslandEventHooks() {
         ensureIslandEventHooks(null)
         hookPluginLoadForIslandHooks()
         setupGenericIslandViewDetector()
     }
 
-    /**
-     * 安装灵动岛事件钩子（插件加载后才能真正装上）。
-     *
-     * 日志实测（HyperOS4，2026-09-16 20:04）：
-     * - `com.android.systemui.statusbar.phone.FocusedNotifPrompt*` / `MiuiCollapsedStatusBarFragment`
-     *   在这台设备上**全部 miss**（以前写的类名已经不存在了，所以灵动岛钩子从未生效）；
-     * - 真正的实现对在 **`miui.systemui.dynamicisland.**`**：logcat 里出现
-     *   `miui.systemui.dynamicisland.view.DynamicIslandBigIslandView`（`selfBlur` 日志）、
-     *   `DynamicIslandWindowViewController` / `DynamicIslandWindow`（独立窗口）/ `DynamicIslandService`；
-     * - 这些类位于 **MIUI systemui 插件** 里，而我们 init 的时候插件还没加载
-     *   （日志里插件在 20:04:09~10 才加载，我们 20:04:06 就 init 了），所以必须“插件加载后再补”。
-     */
     private fun ensureIslandEventHooks(classLoader: ClassLoader?) {
         if (islandHooksInstalled) return
         if (islandHookAttempts++ > ISLAND_HOOK_MAX_ATTEMPTS) return
@@ -489,11 +367,12 @@ object BatteryDetailIndicator : BaseHook() {
                 ?: continue
             runCatching {
                 val methods = cls.declaredMethods.toList().distinct()
-                methods.forEach { method ->
-                    if (method.name.startsWith("access$")) return@forEach
+                    .filter { !it.name.startsWith("access$") }
+                for (method in methods) {
+                    val methodName = method.name
                     runCatching {
-                        method.createBeforeHook {
-                            onIslandEvent("${cls.simpleName}#${method.name}", null)
+                        listOf(method).createBeforeHooks { param ->
+                            onIslandEvent(cls.simpleName + "#" + methodName, param.thisObject as? View)
                         }
                     }
                 }
@@ -513,7 +392,6 @@ object BatteryDetailIndicator : BaseHook() {
         }
     }
 
-    /** 插件加载完成后再补一次灵动岛钩子（与 NewPluginHelperKt 同一个入口） */
     private fun hookPluginLoadForIslandHooks() {
         if (pluginLoadHookInstalled) return
         runCatching {
@@ -535,10 +413,6 @@ object BatteryDetailIndicator : BaseHook() {
         }
     }
 
-    /**
-     * 通用兵：不知道 HyperOS 每个版本的具体类名时，用“类名包含 island”的 View 回调兜底。
-     * 只挂 3 个 View 方法，并用类缓存避免每次调用都做字符串判断。
-     */
     private fun setupGenericIslandViewDetector() {
         runCatching {
             val viewCls = android.view.View::class.java
@@ -583,11 +457,6 @@ object BatteryDetailIndicator : BaseHook() {
         }
     }
 
-    /**
-     * 灵动岛事件现场快照：
-     * - 岛视图 vs 指示器的屏幕矩形（判断是否被遮住）；
-     * - 指示器与“参考视图（状态栏时钟）”的 MIUI 材质属性对比（判断是不是材质管线把文字烤糊了）。
-     */
     private fun onIslandEvent(reason: String, source: View?) {
         if (DIAG_LOG && loggedIslandEvents.add(reason)) {
             diagLog("island event(new): $reason")
@@ -622,10 +491,6 @@ object BatteryDetailIndicator : BaseHook() {
         scheduleRenderReset(reason)
     }
 
-    /**
-     * 岛事件后的“修复尝试”（都在开关后面，默认关，一个一个试）。
-     * @param settle true 表示动画应该已经结束（+700ms/+1500ms），此时修才不会被系统改回去
-     */
     private fun islandRepair(reason: String, settle: Boolean) {
         if (!settle) return
         for (view in mStatusbarTextIcons) {
@@ -637,7 +502,6 @@ object BatteryDetailIndicator : BaseHook() {
         }
     }
 
-    /** 方案2：把指示器自身的 MIUI 模糊/混合属性全部清掉 */
     private fun clearOwnBlur(view: View, reason: String) {
         runCatching {
             MiBlurUtils.clearContainerPassBlur(view)
@@ -649,11 +513,6 @@ object BatteryDetailIndicator : BaseHook() {
         }
     }
 
-    /**
-     * 方案3：按“清晰”的参考视图（状态栏时钟）把材质配置镜像过来。
-     * 日志已知：状态栏窗口（NotificationShade）存在 MIUI 的 PassBlur 通道（纹理缩放比 0.25），
-     * 而 MIUI 自己的文字视图是带材质配置的、我们注入的视图没有，所以先按参考视图配一份。
-     */
     private fun mirrorReferenceMaterial(view: View, reason: String) {
         val clock = findClockOf(view) ?: return
         val mode = miInt(clock, "getMiViewBlurMode")
@@ -664,10 +523,9 @@ object BatteryDetailIndicator : BaseHook() {
         miCall(view, "setMiBackgroundBlurMode", bgMode ?: 0)
         miCall(view, "setPassWindowBlurEnabled", pass ?: false)
         runCatching { MiBlurUtils.setMemberBlendColor(view, false, color) }
-        diagLog("mirror($reason): clock mode=$mode bgMode=$bgMode pass=$pass color=${Integer.toHexString(color)}")
+        diagLog("mirror($reason): clock mode=$mode bgMode=$bgMode pass=$pass color=${java.lang.Integer.toHexString(color)}")
     }
 
-    /** 方案4：把指示器从父容器里摘下来再挂回去，强制系统重新采集它的纹理 */
     private fun reattachIndicator(view: View, reason: String) {
         val parent = view.parent as? ViewGroup ?: return
         val index = parent.indexOfChild(view)
@@ -682,7 +540,6 @@ object BatteryDetailIndicator : BaseHook() {
         }
     }
 
-    /** 方案5：把整窗口重画一次，让 PassBlur 重新采集（最重，最后试） */
     private fun forceWindowRedraw(view: View, reason: String) {
         runCatching {
             val root = view.rootView
@@ -694,7 +551,6 @@ object BatteryDetailIndicator : BaseHook() {
         }
     }
 
-    /** 自底向上读一段 MIUI 材质属性，用来对比“我们的视图”和“系统自己的视图” */
     private fun materialProbe(view: View, label: String): String {
         val sb = StringBuilder("  material[$label]")
         var current: View? = view
@@ -734,17 +590,6 @@ object BatteryDetailIndicator : BaseHook() {
     private fun miCall(view: View, name: String, vararg args: Any?): Boolean =
         runCatching { view.callMethod(name, *args) }.isSuccess
 
-    // ==================================================================
-    // 渲染状态复位
-    // ==================================================================
-
-    /**
-     * 把指示器拉回"中性渲染状态"，不改变可见性策略（可见性仍由 setVisibilityByController /
-     * 系统状态机决定），只清掉缩放、位移、透明度、图层这些"被系统动画留在中间态"的属性。
-     *
-     * @param strong 额外做一次 HARDWARE -> NONE 强制重栅格化，并逐级 invalidate 父容器
-     *               （用于动画被打断、图层里留着陈旧位图的情况）
-     */
     private fun resetRenderState(view: View, strong: Boolean, reason: String) {
         runCatching {
             view.setLayerType(View.LAYER_TYPE_NONE, null)
@@ -764,7 +609,7 @@ object BatteryDetailIndicator : BaseHook() {
                 number.translationX = 0f
                 number.translationY = 0f
                 if (strong) {
-                    // 强制重新栅格化：某些情况下图层里留的是被缩放过的陈旧内容，直接 invalidate 不会重画
+
                     number.setLayerType(View.LAYER_TYPE_HARDWARE, null)
                     number.invalidate()
                     number.setLayerType(View.LAYER_TYPE_NONE, null)
@@ -784,7 +629,7 @@ object BatteryDetailIndicator : BaseHook() {
         }.onFailure {
             XposedLog.e(HOOK_TAG, lpparam.packageName, "resetRenderState failed($reason): ${it.message}")
         }
-        // 日志改到 resetAllIcons() 里一次性输出摘要，避免每个视图一行把日志刷爆
+
     }
 
     private fun resetAllIcons(reason: String, strong: Boolean) {
@@ -807,7 +652,6 @@ object BatteryDetailIndicator : BaseHook() {
         }
     }
 
-    /** 一行摘要（场 -> 属性），比整段 describeView 省很多日志量 */
     private fun resetSummaryLine(view: View): String {
         val number = view.getObjectFieldOrNullAs<TextView>(FIELD_NETWORK_SPEED_NUMBER_TEXT) ?: (view as? TextView)
         val tv = if (number != null) {
@@ -820,10 +664,6 @@ object BatteryDetailIndicator : BaseHook() {
             ",trans=${view.translationX},${view.translationY}]$tv"
     }
 
-    /**
-     * 合并 + 防自激的复位入口：同一时刻只允许一个复位在跑，且 RESET_COOLDOWN_MS 内不重复。
-     * 这样即使某个系统回调在复位过程中被再次触发，也不会形成无限循环。
-     */
     private fun requestRenderReset(reason: String, strong: Boolean = true) {
         if (resetting) return
         val now = SystemClock.uptimeMillis()
@@ -837,11 +677,6 @@ object BatteryDetailIndicator : BaseHook() {
         }
     }
 
-    /**
-     * setVisibleState 高频回调检测。
-     * 日志实测出现过 ~165 次/秒的调用（相当于每帧都在回调），此时系统图标进出场动画会被反复重启，
-     * 表现就是指示器“鬼畜左右跳”。这里只做检测 + 打一次调用栈，不触发任何复位。
-     */
     private fun noteVisibleStateBurst() {
         val now = SystemClock.uptimeMillis()
         if (now - burstWindowStart > 1000L) {
@@ -859,7 +694,6 @@ object BatteryDetailIndicator : BaseHook() {
         }
     }
 
-    /** 事件发生后按 RESET_DELAYS 在多个时间点补复位（带合并冷却，防止自激） */
     private fun scheduleRenderReset(reason: String) {
         val now = SystemClock.uptimeMillis()
         if (resetting || now < scheduleCooldownUntil) return
@@ -871,21 +705,16 @@ object BatteryDetailIndicator : BaseHook() {
         }
         for (delay in RESET_DELAYS) {
             handler.postDelayed({
-                // 动画进行中的时间点只做轻复位，避免和系统的动画抢属性
+
                 val strong = delay == 0L || delay >= 700L
                 requestRenderReset("$reason+${delay}ms", strong)
-                // 动画应该已经结束了，此时才能试修复（早修会被系统改回去）
+
                 islandRepair(reason, settle = delay >= 700L)
                 if (delay >= 700L) dumpIcons("$reason+${delay}ms")
             }, delay)
         }
     }
 
-    // ==================================================================
-    // 实例唯一化（防止多份指示器叠加导致的"糊/重影"）
-    // ==================================================================
-
-    /** 清掉已经脱离视图树的实例（parent 为 null 的实例永远不可能再显示） */
     private fun pruneTrackedIcons(reason: String) {
         if (mStatusbarTextIcons.isEmpty()) return
         var removed = 0
@@ -899,11 +728,6 @@ object BatteryDetailIndicator : BaseHook() {
         }
     }
 
-    /**
-     * 同一个容器里只允许存在一份指示器。
-     * 灵动岛切换期间状态栏布局可能被重建或重新插入，两份文字叠在一起看起来就是"糊/重影"，
-     * 而且这类问题不会因为改文字渲染方式而消失（这也是之前一直修不好的原因之一）。
-     */
     private fun dedupeInContainer(container: ViewGroup, keep: View?, reason: String) {
         if (container.childCount <= 1) return
         val duplicates = ArrayList<View>()
@@ -915,7 +739,7 @@ object BatteryDetailIndicator : BaseHook() {
         }
         if (duplicates.isEmpty()) return
         for (child in duplicates) {
-            // 先抓现场再移除，日志里的 parent 才是有用的（移除后就变成 null 了）
+
             val snapshot = if (DIAG_LOG) describeView(child) else null
             runCatching { container.removeView(child) }
             mStatusbarTextIcons.remove(child)
@@ -932,10 +756,6 @@ object BatteryDetailIndicator : BaseHook() {
             dedupeInContainer(parent, view, reason)
         }
     }
-
-    // ==================================================================
-    // 诊断（定位糊掉属于哪一类）
-    // ==================================================================
 
     private fun dumpIcons(reason: String) {
         if (!DIAG_LOG) return
@@ -988,11 +808,6 @@ object BatteryDetailIndicator : BaseHook() {
         return sb.toString()
     }
 
-    /**
-     * 最外层宿主类名（例如 MiuiNotificationStatusContainer / ControlCenterFakeStatusIcons）。
-     * MIUI 会在每个状态栏宿主里各放一份我们的图标（下拉控制中心的“假状态栏图标区”也是一个宿主），
-     * 所以“同一时刻到底有几份可见、哪一份在跳”必须靠宿主名区分。
-     */
     private fun hostName(view: View): String {
         var current: View? = view.parent as? View
         var last = view.javaClass.simpleName
@@ -1005,7 +820,6 @@ object BatteryDetailIndicator : BaseHook() {
         return last
     }
 
-    /** 只读取 MIUI 的 View 材质状态（方法不存在就跳过），用于判断"糊"是否由材质引起 */
     private fun miuiBlurState(view: View): String {
         val viewMode = runCatching { view.callMethod("getMiViewBlurMode") as? Int }.getOrNull()
         val bgMode = runCatching { view.callMethod("getMiBackgroundBlurMode") as? Int }.getOrNull()
@@ -1058,9 +872,9 @@ object BatteryDetailIndicator : BaseHook() {
     }
 
     private fun updateStatusbarViews(tii: TextIconInfo) {
-        // 灵动岛钩子要等 systemui 插件加载后才能装上（见 ensureIslandEventHooks 注释），这里顺带重试
+
         if (!islandHooksInstalled) ensureIslandEventHooks(null)
-        // 每 tick 先做一次"卫生"：淘汰失效实例 + 容器内去重，避免多份实例叠加
+
         pruneTrackedIcons("tick")
         dedupeAll("tick")
 
@@ -1076,8 +890,7 @@ object BatteryDetailIndicator : BaseHook() {
                     }
                 syncColorWithClock(tv)
             }
-            // 兜底复位：任何一个 tick 都把渲染状态拉回中性，
-            // 这样"事件复位漏掉的那一次"最多 2 秒后也会自愈。
+
             if (tv.isAttachedToWindow) {
                 resetRenderState(tv, strong = STRONG_RESET_ON_TICK, reason = "tick")
             }
@@ -1207,7 +1020,7 @@ object BatteryDetailIndicator : BaseHook() {
                 if (!mStatusbarTextIcons.contains(existing)) {
                     mStatusbarTextIcons.add(existing)
                 }
-                // 同一容器里如果已经有别的指示器（例如上一轮布局重建残留的），清掉
+
                 dedupeInContainer(mGroup, existing, "right.existing")
                 param.result = existing
             } else {
@@ -1333,7 +1146,7 @@ object BatteryDetailIndicator : BaseHook() {
                 if (!mStatusbarTextIcons.contains(existing)) {
                     mStatusbarTextIcons.add(existing)
                 }
-                // 布局重建后同一容器里可能残留多份指示器，这里直接清掉多余的那份
+
                 dedupeInContainer(container, existing, "left.existing")
                 syncColorWithClock(existing, clockView as? TextView)
                 resetRenderState(existing, strong = true, reason = "inject.existing")
@@ -1376,7 +1189,7 @@ object BatteryDetailIndicator : BaseHook() {
                         runCatching { v.callMethod(METHOD_SET_VISIBILITY_BY_CONTROLLER, true) }
                             .onFailure { v.visibility = View.VISIBLE }
                     }
-                    // 整片图标区重新出现，系统的淡入/位移动画刚结束，补一次复位
+
                     scheduleRenderReset("showSystemIconArea")
                 }
             }
