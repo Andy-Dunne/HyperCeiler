@@ -27,7 +27,9 @@ import android.os.HandlerThread
 import android.os.Looper
 import android.os.Message
 import android.os.PowerManager
+import android.os.SystemClock
 import android.text.TextUtils
+import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
@@ -71,7 +73,23 @@ import java.util.concurrent.CopyOnWriteArrayList
  *    坐标，以及只读的 MIUI 材质状态和目标 View 树里带标记的节点数，用来判定故障属于
  *    "多实例 / 动画中间态 / 遮挡材质" 中的哪一类。修好后把 DIAG_LOG 改成 false 即可。
  *
- * 注意：诊断日志走 XposedLog.d，需要在模块设置里把日志级别调到 Debug 才能看到。
+ * 第二轮改动（基于第一份 LSPosed 日志的分析结论）：
+ *
+ * 4. 修掉自激死循环：原实现在 setVisibleState 里“同步复位 + 挂 5 个延时复位”，
+ *    实测与系统回调互相激发，达到 ~165 次/秒、7 秒打印 4.5 万行日志（LSPosed 日志环形缓冲被刷掉 4 次），
+ *    并反复重启系统图标动画，表现就是指示器“鬼畜左右跳”。现在：
+ *      - setVisibleState 里默认不再复位（RESET_ON_VISIBLE_STATE）、不再 requestLayout（REQUEST_LAYOUT_ON_VISIBLE_STATE）；
+ *      - 复位入口 requestRenderReset() 做了重入保护和 300ms 冷却，批次合并 500ms；
+ *      - 增加频率监控 noteVisibleStateBurst()，超阀值会打一次调用栈（用来找出真正的高频来源）。
+ *
+ * 5. 日志结论：所有采样里 layer=0 / alpha=1.0 / scale=1,1 / trans=0,0，即“渲染状态停在中间态”
+ *    这个假设基本被排除；“糊”更可能是遮挡/几何/多份实例叠加。因此灵动岛事件现在会额外打印
+ *    岛视图和指示器的屏幕矩形及是否重叠（onIslandEvent），下一轮日志就能直接定性。
+ *
+ * 关于日志：HyperCeiler 的日志级别有个坑——release 变体下 LogLevelManager.getEffectiveLogLevel()
+ * 会把「详细日志」强制降级成「一般日志」，此时 XposedLog.d / w / i 全部不会输出，只有 XposedLog.e 能出来。
+ * 所以诊断输出统一走 diagLog()，默认（DIAG_FORCE_OUTPUT = true）使用 e 通道，
+ * 无论 release 还是 debug 包，只要日志等级不是「禁用日志输出」就能看到。
  */
 object BatteryDetailIndicator : BaseHook() {
 
@@ -99,12 +117,58 @@ object BatteryDetailIndicator : BaseHook() {
     private const val STRONG_RESET_ON_TICK = false
 
     /**
+     * 诊断输出是否走“一定看得见”的通道。
+     *
+     * true  -> 用 XposedLog.e（日志等级 ≥ 一般日志即可见，release 包也能看到）
+     * false -> 用 XposedLog.d（仅 debug 包 + 「详细日志」可见）
+     *
+     * 因为 release 变体会把「详细日志」降级成「一般日志」，定位阶段请保持 true，
+     * 否则你会看到日志里什么都没有，误以为代码没生效。
+     */
+    private const val DIAG_FORCE_OUTPUT = true
+
+    /** 诊断日志统一出口，见 DIAG_FORCE_OUTPUT 说明 */
+    private fun diagLog(msg: String) {
+        if (DIAG_FORCE_OUTPUT) {
+            XposedLog.e(HOOK_TAG, lpparam.packageName, msg)
+        } else {
+            XposedLog.d(HOOK_TAG, lpparam.packageName, msg)
+        }
+    }
+
+    /**
      * 灵动岛动画时长不确定，事件发生后在若干时间点补做复位：
      * - 0ms：立刻清掉上一轮事件可能留下的陈旧状态
      * - 120/320ms：动画进行中，只做"轻复位"，不和系统的动画抢属性
      * - 700/1500ms：动画应当已经结束，做"强复位"（含强制重栅格化）并抓一次现场
      */
     private val RESET_DELAYS = longArrayOf(0L, 120L, 320L, 700L, 1500L)
+
+    /**
+     * 复位批次的合并冷却时间。
+     * 实测（LSPosed 日志）setVisibleState 在高频回调时会和复位互相激发：7 秒内打出 4.5 万行日志，
+     * LSPosed 日志环形缓冲被刷掉 4 次，同时系统图标进出场动画被反复重启 -> 指示器鬼畜左右跳。
+     */
+    private const val SCHEDULE_COOLDOWN_MS = 500L
+
+    /** 单次复位的最小间隔，防止“复位 -> 触发系统回调 -> 再复位”自激 */
+    private const val RESET_COOLDOWN_MS = 300L
+
+    /** setVisibleState 每秒调用次数超过该值判定为疑似自激/死循环，并打一次调用栈 */
+    private const val VISIBLE_STATE_BURST_LIMIT = 30
+
+    /**
+     * 是否还在 setVisibleState 里做复位。
+     * 日志实测结论：这个入口不是“糊”的原因（所有采样里 layer/alpha/scale/trans 全是干净值），
+     * 但它调用频率极高，在这里复位只会制造自激。默认关掉做对比实验时再打。
+     */
+    private const val RESET_ON_VISIBLE_STATE = false
+
+    /**
+     * 是否在 setVisibleState 里手动 requestLayout。
+     * 请求布局会诱发下一轮 setVisibleState 回调，是指示器“鬼畜左右跳”的高度嫌疑人，默认关。
+     */
+    private const val REQUEST_LAYOUT_ON_VISIBLE_STATE = false
 
     private const val TAG_SLOT_TEXT_ICON = "slot_text_icon"
     private const val TAG_NETWORK_SPEED_NUMBER = "network_speed_number"
@@ -216,6 +280,14 @@ object BatteryDetailIndicator : BaseHook() {
     private var workerHandler: Handler? = null
     private var mainHandler: Handler? = null
 
+    // ---- 防自激 / 频率监控 ----
+    private var resetting = false
+    private var resetCooldownUntil = 0L
+    private var scheduleCooldownUntil = 0L
+    private var burstWindowStart = 0L
+    private var burstCount = 0
+    private var lastBurstStackAt = 0L
+
     private data class TextIconInfo(
         var iconShow: Boolean = true,
         var iconText: String = ""
@@ -281,13 +353,15 @@ object BatteryDetailIndicator : BaseHook() {
                     unit?.visibility = v
                     nsView.visibility = v
 
-                    nsView.invalidate()
-                    nsView.requestLayout()
+                    noteVisibleStateBurst()
 
-                    // 原来的 setLayerType(HARDWARE -> NONE) 写法保留在 resetRenderState(strong = true) 里，
-                    // 但不再只依赖这一个入口：灵动岛不走 setVisibleState，所以这里只做"顺带复位"。
-                    resetRenderState(nsView, strong = true, reason = "setVisibleState")
-                    scheduleRenderReset("setVisibleState")
+                    nsView.invalidate()
+                    if (REQUEST_LAYOUT_ON_VISIBLE_STATE) nsView.requestLayout()
+
+                    // 注意：这里默认不做复位（见 RESET_ON_VISIBLE_STATE 注释）。
+                    // 原实现在这里同步复位 + 挂 5 个延时复位，实测会与 setVisibleState 互相激发，
+                    // 形成 ~165 次/秒的回调死循环，日志刷爆、指示器左右跳。
+                    if (RESET_ON_VISIBLE_STATE) requestRenderReset("setVisibleState")
                 }
             }
         }.onFailure {
@@ -346,25 +420,59 @@ object BatteryDetailIndicator : BaseHook() {
         runCatching {
             val cls = loadClassOrNull(className, lpparam.classLoader)
             if (cls == null) {
-                if (DIAG_LOG) XposedLog.d(HOOK_TAG, lpparam.packageName, "island hook miss(class): $className")
+                if (DIAG_LOG) diagLog("island hook miss(class): $className")
                 return
             }
             val methods = (cls.declaredMethods.toList() + cls.methods.toList())
                 .distinct()
                 .filter { it.name == methodName }
             if (methods.isEmpty()) {
-                if (DIAG_LOG) XposedLog.d(HOOK_TAG, lpparam.packageName, "island hook miss(method): $className#$methodName")
+                if (DIAG_LOG) diagLog("island hook miss(method): $className#$methodName")
                 return
             }
-            methods.createBeforeHooks {
-                if (DIAG_LOG) {
-                    XposedLog.d(HOOK_TAG, lpparam.packageName, "island event: $reason ($className#$methodName)")
-                }
-                scheduleRenderReset(reason)
+            methods.createBeforeHooks { param ->
+                onIslandEvent(reason, param.thisObject as? View)
             }
         }.onFailure {
             XposedLog.e(HOOK_TAG, lpparam.packageName, "island hook failed: $className#$methodName: ${it.message}")
         }
+    }
+
+    /**
+     * 灵动岛事件现场快照：重点是对比“岛”和“我们的指示器”在屏幕上的矩形是否重叠。
+     * 这是判定“糊”到底是“被岛/材质遮住”还是“主状态机相关”的关键数据。
+     */
+    private fun onIslandEvent(reason: String, source: View?) {
+        if (!DIAG_LOG) {
+            scheduleRenderReset(reason)
+            return
+        }
+        diagLog("island event: $reason")
+        if (source != null) {
+            val island = IntArray(2)
+            runCatching { source.getLocationOnScreen(island) }
+            val iw = source.width
+            val ih = source.height
+            diagLog(
+                "  island view=${source.javaClass.simpleName} onScreen=[${island[0]},${island[1]}," +
+                    "${island[0] + iw},${island[1] + ih}] size=${iw}x$ih vis=${source.visibility} " +
+                    "alpha=${source.alpha} scale=${source.scaleX},${source.scaleY} layer=${source.layerType}"
+            )
+            for (view in mStatusbarTextIcons) {
+                if (!view.isAttachedToWindow) continue
+                val loc = IntArray(2)
+                runCatching { view.getLocationOnScreen(loc) }
+                val w = view.width
+                val h = view.height
+                val overlapX = w > 0 && iw > 0 && loc[0] < island[0] + iw && island[0] < loc[0] + w
+                val overlapY = h > 0 && ih > 0 && loc[1] < island[1] + ih && island[1] < loc[1] + h
+                diagLog(
+                    "  ours host=${hostName(view)} onScreen=[${loc[0]},${loc[1]},${loc[0] + w},${loc[1] + h}] " +
+                        "shown=${runCatching { view.isShown }.getOrDefault(false)} overlapX=$overlapX overlapY=$overlapY"
+                )
+            }
+        }
+        scheduleRenderReset(reason)
     }
 
     // ==================================================================
@@ -417,40 +525,97 @@ object BatteryDetailIndicator : BaseHook() {
         }.onFailure {
             XposedLog.e(HOOK_TAG, lpparam.packageName, "resetRenderState failed($reason): ${it.message}")
         }
-
-        if (DIAG_LOG) {
-            XposedLog.d(HOOK_TAG, lpparam.packageName, "reset($reason,strong=$strong): ${describeView(view)}")
-        }
+        // 日志改到 resetAllIcons() 里一次性输出摘要，避免每个视图一行把日志刷爆
     }
 
     private fun resetAllIcons(reason: String, strong: Boolean) {
         pruneTrackedIcons(reason)
         var skipped = 0
+        val summary = StringBuilder()
         for (view in mStatusbarTextIcons) {
             if (!view.isAttachedToWindow) {
                 skipped++
                 continue
             }
             resetRenderState(view, strong, reason)
+            if (DIAG_LOG) summary.append(resetSummaryLine(view))
         }
-        if (DIAG_LOG && skipped > 0) {
-            XposedLog.d(HOOK_TAG, lpparam.packageName, "reset($reason) skipped detached=$skipped")
+        if (DIAG_LOG && (summary.isNotEmpty() || skipped > 0)) {
+            diagLog(
+                "reset($reason,strong=$strong) attached=${mStatusbarTextIcons.size - skipped} " +
+                    "skipped=$skipped$summary"
+            )
         }
     }
 
-    /** 事件发生后按 RESET_DELAYS 在多个时间点补复位，避免"动画结束时刻"抓不准 */
+    /** 一行摘要（场 -> 属性），比整段 describeView 省很多日志量 */
+    private fun resetSummaryLine(view: View): String {
+        val number = view.getObjectFieldOrNullAs<TextView>(FIELD_NETWORK_SPEED_NUMBER_TEXT) ?: (view as? TextView)
+        val tv = if (number != null) {
+            " tv[layer=${number.layerType},alpha=${number.alpha},scale=${number.scaleX},${number.scaleY},trans=${number.translationX},${number.translationY}]"
+        } else {
+            ""
+        }
+        return "\n    ${hostName(view)}[vis=${view.visibility},shown=${runCatching { view.isShown }.getOrDefault(false)}" +
+            ",layer=${view.layerType},alpha=${view.alpha},scale=${view.scaleX},${view.scaleY}" +
+            ",trans=${view.translationX},${view.translationY}]$tv"
+    }
+
+    /**
+     * 合并 + 防自激的复位入口：同一时刻只允许一个复位在跑，且 RESET_COOLDOWN_MS 内不重复。
+     * 这样即使某个系统回调在复位过程中被再次触发，也不会形成无限循环。
+     */
+    private fun requestRenderReset(reason: String, strong: Boolean = true) {
+        if (resetting) return
+        val now = SystemClock.uptimeMillis()
+        if (now < resetCooldownUntil) return
+        resetCooldownUntil = now + RESET_COOLDOWN_MS
+        resetting = true
+        try {
+            resetAllIcons(reason, strong)
+        } finally {
+            resetting = false
+        }
+    }
+
+    /**
+     * setVisibleState 高频回调检测。
+     * 日志实测出现过 ~165 次/秒的调用（相当于每帧都在回调），此时系统图标进出场动画会被反复重启，
+     * 表现就是指示器“鬼畜左右跳”。这里只做检测 + 打一次调用栈，不触发任何复位。
+     */
+    private fun noteVisibleStateBurst() {
+        val now = SystemClock.uptimeMillis()
+        if (now - burstWindowStart > 1000L) {
+            burstWindowStart = now
+            burstCount = 0
+        }
+        burstCount++
+        if (burstCount == VISIBLE_STATE_BURST_LIMIT) {
+            diagLog("!! setVisibleState 调用频率 > $VISIBLE_STATE_BURST_LIMIT 次/秒（疑似回调自激），已停止在该入口做复位")
+        }
+        if (burstCount >= VISIBLE_STATE_BURST_LIMIT && now - lastBurstStackAt > 5000L) {
+            lastBurstStackAt = now
+            val frames = Log.getStackTraceString(Throwable()).split('\n').take(16).joinToString("\n")
+            diagLog("---- setVisibleState 调用栈（截断 16 帧）----\n$frames")
+        }
+    }
+
+    /** 事件发生后按 RESET_DELAYS 在多个时间点补复位（带合并冷却，防止自激） */
     private fun scheduleRenderReset(reason: String) {
+        val now = SystemClock.uptimeMillis()
+        if (resetting || now < scheduleCooldownUntil) return
+        scheduleCooldownUntil = now + SCHEDULE_COOLDOWN_MS
         val handler = mainHandler
         if (handler == null) {
-            resetAllIcons("$reason:sync", true)
+            requestRenderReset("$reason:sync")
             return
         }
         for (delay in RESET_DELAYS) {
             handler.postDelayed({
                 // 动画进行中的时间点只做轻复位，避免和系统的动画抢属性
                 val strong = delay == 0L || delay >= 700L
-                resetAllIcons("$reason+${delay}ms", strong)
-                if (DIAG_LOG && delay >= 700L) dumpIcons("$reason+${delay}ms")
+                requestRenderReset("$reason+${delay}ms", strong)
+                if (delay >= 700L) dumpIcons("$reason+${delay}ms")
             }, delay)
         }
     }
@@ -469,7 +634,7 @@ object BatteryDetailIndicator : BaseHook() {
             }
         }
         if (DIAG_LOG && removed > 0) {
-            XposedLog.d(HOOK_TAG, lpparam.packageName, "prune($reason) removed=$removed left=${mStatusbarTextIcons.size}")
+            diagLog("prune($reason) removed=$removed left=${mStatusbarTextIcons.size}")
         }
     }
 
@@ -494,7 +659,7 @@ object BatteryDetailIndicator : BaseHook() {
             runCatching { container.removeView(child) }
             mStatusbarTextIcons.remove(child)
             if (snapshot != null) {
-                XposedLog.w(HOOK_TAG, lpparam.packageName, "dedupe($reason) removed duplicate: $snapshot")
+                diagLog("dedupe($reason) removed duplicate: $snapshot")
             }
         }
     }
@@ -515,20 +680,20 @@ object BatteryDetailIndicator : BaseHook() {
         if (!DIAG_LOG) return
         val tracked = mStatusbarTextIcons.size
         val attached = mStatusbarTextIcons.count { it.isAttachedToWindow }
-        XposedLog.d(HOOK_TAG, lpparam.packageName, "==== dump[$reason] tracked=$tracked attached=$attached ====")
+        diagLog("==== dump[$reason] tracked=$tracked attached=$attached ====")
         for (view in mStatusbarTextIcons) {
-            XposedLog.d(HOOK_TAG, lpparam.packageName, "  tracked: ${describeView(view)}")
+            diagLog("  tracked: ${describeView(view)}")
         }
         val root = mStatusbarTextIcons.firstOrNull { it.isAttachedToWindow }?.rootView
         if (root != null) {
             val found = ArrayList<View>()
             collectTaggedIcons(root, found)
-            XposedLog.d(HOOK_TAG, lpparam.packageName, "  taggedInRoot=${found.size} root=${root.javaClass.name}")
+            diagLog("  taggedInRoot=${found.size} root=${root.javaClass.name}")
             found.forEachIndexed { index, view ->
-                XposedLog.d(HOOK_TAG, lpparam.packageName, "    #$index ${describeView(view)}")
+                diagLog("    #$index ${describeView(view)}")
             }
         }
-        XposedLog.d(HOOK_TAG, lpparam.packageName, "==== dump end[$reason] ====")
+        diagLog("==== dump end[$reason] ====")
     }
 
     private fun describeView(view: View): String = buildString {
@@ -544,6 +709,7 @@ object BatteryDetailIndicator : BaseHook() {
         append(" bounds=[").append(view.left).append(',').append(view.top).append(',')
         append(view.right).append(',').append(view.bottom).append(']')
         append(" size=").append(view.width).append('x').append(view.height)
+        append(" host=").append(hostName(view))
         append(" parent=").append(parentChain(view))
         append(' ').append(miuiBlurState(view))
     }
@@ -559,6 +725,23 @@ object BatteryDetailIndicator : BaseHook() {
             level++
         }
         return sb.toString()
+    }
+
+    /**
+     * 最外层宿主类名（例如 MiuiNotificationStatusContainer / ControlCenterFakeStatusIcons）。
+     * MIUI 会在每个状态栏宿主里各放一份我们的图标（下拉控制中心的“假状态栏图标区”也是一个宿主），
+     * 所以“同一时刻到底有几份可见、哪一份在跳”必须靠宿主名区分。
+     */
+    private fun hostName(view: View): String {
+        var current: View? = view.parent as? View
+        var last = view.javaClass.simpleName
+        var level = 0
+        while (current != null && level < 10) {
+            last = current.javaClass.simpleName
+            current = current.parent as? View
+            level++
+        }
+        return last
     }
 
     /** 只读取 MIUI 的 View 材质状态（方法不存在就跳过），用于判断"糊"是否由材质引起 */
