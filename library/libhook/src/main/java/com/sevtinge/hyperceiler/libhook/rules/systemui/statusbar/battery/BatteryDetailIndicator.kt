@@ -836,8 +836,10 @@ object BatteryDetailIndicator : BaseHook() {
 
             iconTextView.setPaddingRelative(leftMarginPx, topMarginPx, rightMarginPx, 0)
 
-            lp.width = if (fixedWidth > 10) dp2px(fixedWidth.toFloat()) else worstCaseWidth(iconTextView)
-            iconView.layoutParams = lp
+            if (fixedWidth > 10) {
+                lp.width = dp2px(fixedWidth.toFloat())
+                iconView.layoutParams = lp
+            }
 
             when (align) {
                 2 -> iconTextView.gravity = Gravity.START or Gravity.CENTER_VERTICAL
@@ -845,27 +847,6 @@ object BatteryDetailIndicator : BaseHook() {
                 4 -> iconTextView.gravity = Gravity.END or Gravity.CENTER_VERTICAL
                 else -> iconTextView.gravity = Gravity.START or Gravity.CENTER_VERTICAL
             }
-        }
-
-        private fun worstCaseWidth(tv: TextView): Int {
-            val temp = "-88.8$UNIT_CELSIUS"
-            val curr = "-999$UNIT_MA"
-            val watt = "188.88$UNIT_WATT"
-            val parts = when (content) {
-                1 -> if (reverseOrder) listOf(curr, temp) else listOf(temp, curr)
-                2 -> listOf(watt)
-                3 -> listOf(curr)
-                4 -> if (reverseOrder) listOf(watt, temp) else listOf(temp, watt)
-                else -> listOf(curr, watt)
-            }
-            val paint = tv.paint
-            val measured = if (isMultiLineContent(content) && !singleRow) {
-                parts.maxOf { paint.measureText(it) }
-            } else {
-                paint.measureText(parts.joinToString(" "))
-            }
-            val textWidth = measured.toInt() + 2
-            return maxOf(textWidth + tv.paddingLeft + tv.paddingRight, tv.minimumWidth)
         }
 
         private fun isMultiLineContent(contentMode: Int): Boolean {
