@@ -66,7 +66,7 @@ object BatteryDetailIndicator : BaseHook() {
     private const val MSG_DATA_UPDATE = 100021
     private const val MSG_WORKER_TICK = 200021
 
-    private const val DIAG_LOG = true
+    private const val DIAG_LOG = false
 
     private const val DIAG_LOG_TICK = false
 
@@ -84,7 +84,7 @@ object BatteryDetailIndicator : BaseHook() {
 
     private val RESET_DELAYS = longArrayOf(0L, 120L, 320L, 700L, 1500L)
 
-    private const val SCHEDULE_COOLDOWN_MS = 500L
+    private const val SCHEDULE_COOLDOWN_MS = 1000L
 
     private const val RESET_COOLDOWN_MS = 300L
 
@@ -94,29 +94,15 @@ object BatteryDetailIndicator : BaseHook() {
 
     private const val REQUEST_LAYOUT_ON_VISIBLE_STATE = false
 
-    private val ISLAND_CLASS_CANDIDATES = listOf(
-        "miui.systemui.dynamicisland.view.DynamicIslandBigIslandView",
-        "miui.systemui.dynamicisland.view.DynamicIslandWindowViewImpl",
-        "miui.systemui.dynamicisland.view.DynamicIslandContentView",
-        "miui.systemui.dynamicisland.view.DynamicIslandBaseContentView",
-        "miui.systemui.dynamicisland.view.DynamicIslandContentFakeView",
-        "miui.systemui.dynamicisland.DynamicIslandWindowViewController",
-        "miui.systemui.dynamicisland.DynamicIslandWindowController",
-        "miui.systemui.dynamicisland.DynamicIslandController",
-        "miui.systemui.dynamicisland.DynamicIslandEventCoordinator",
-        "miui.systemui.dynamicisland.IslandTransitionExecutor",
-        "miui.systemui.dynamicisland.DynamicIslandAnimationDelegateHelper",
+    private const val ISLAND_EVENT_COOLDOWN_MS = 800L
 
-        "com.android.systemui.statusbar.phone.FocusedNotifPromptController",
-        "com.android.systemui.statusbar.phone.FocusedNotifPromptView",
-        "com.android.systemui.statusbar.phone.MiuiCollapsedStatusBarFragment",
-        "com.android.systemui.recents.LauncherProxyService",
-        "com.android.systemui.recents.OverviewProxyService"
-    )
+    private const val PROBE_LINE_CAP = 60
 
-    private const val ISLAND_HOOK_MAX_ATTEMPTS = 30
+    private const val DUMP_COOLDOWN_MS = 5000L
 
-    private const val PROBE_MATERIAL = true
+    private const val ISLAND_FAST_POLL_MS = 200L
+
+    private const val ISLAND_FAST_POLL_MAX_MS = 30000L
 
     private const val CLEAR_OWN_BLUR = false
 
@@ -125,7 +111,6 @@ object BatteryDetailIndicator : BaseHook() {
     private const val REATTACH_ON_SETTLE = false
 
     private const val FORCE_WINDOW_REDRAW_ON_SETTLE = false
-
     private const val TAG_SLOT_TEXT_ICON = "slot_text_icon"
     private const val TAG_NETWORK_SPEED_NUMBER = "network_speed_number"
     private const val TAG_NETWORK_SPEED_UNIT = "network_speed_unit"
@@ -242,12 +227,13 @@ object BatteryDetailIndicator : BaseHook() {
     private var burstCount = 0
     private var lastBurstStackAt = 0L
 
-    private var islandHooksInstalled = false
-    private var islandHookAttempts = 0
-    private var pluginLoadHookInstalled = false
-    private val islandClassCache = java.util.concurrent.ConcurrentHashMap<Class<*>, Boolean>()
-    private val loggedIslandEvents: MutableSet<String> = java.util.Collections.synchronizedSet(HashSet<String>())
-
+    private var islandRootRef: java.lang.ref.WeakReference<View>? = null
+    private var islandWindowTitle: String = ""
+    private var lastIslandVisible = false
+    private var lastIslandEventAt = 0L
+    private var probeLinesLogged = 0
+    private var lastDumpAt = 0L
+    private var islandFastPolling = false
     private data class TextIconInfo(
         var iconShow: Boolean = true,
         var iconText: String = ""
@@ -269,7 +255,7 @@ object BatteryDetailIndicator : BaseHook() {
         }
 
         startDataCollection()
-        setupIslandEventHooks()
+        setupIslandMonitor()
         setupHotReloadCleanup()
     }
 
@@ -351,155 +337,117 @@ object BatteryDetailIndicator : BaseHook() {
         }
     }
 
-    private fun setupIslandEventHooks() {
-        ensureIslandEventHooks(null)
-        hookPluginLoadForIslandHooks()
-        setupGenericIslandViewDetector()
+    private fun setupIslandMonitor() {
+        hookIslandWindowCreation()
     }
 
-    private fun ensureIslandEventHooks(classLoader: ClassLoader?) {
-        if (islandHooksInstalled) return
-        if (islandHookAttempts++ > ISLAND_HOOK_MAX_ATTEMPTS) return
-        var installedAny = false
-        for (name in ISLAND_CLASS_CANDIDATES) {
-            val cls = loadClassOrNull(name, classLoader ?: lpparam.classLoader)
-                ?: loadClassOrNull(name, lpparam.classLoader)
-                ?: continue
-            runCatching {
-                val methods = cls.declaredMethods.toList().distinct()
-                    .filter { !it.name.startsWith("access$") }
-                for (method in methods) {
-                    val methodName = method.name
-                    runCatching {
-                        listOf(method).createBeforeHooks { param ->
-                            onIslandEvent(cls.simpleName + "#" + methodName, param.thisObject as? View)
-                        }
+    private fun hookIslandWindowCreation() {
+        runCatching {
+            val vri = loadClassOrNull("android.view.ViewRootImpl", lpparam.classLoader) ?: return
+            vri.declaredMethods.filter { it.name == "setView" }.createBeforeHooks { param ->
+                runCatching {
+                    val args = param.args
+                    val attrs = args.firstOrNull {
+                        it != null && it.javaClass.name.endsWith("WindowManager.LayoutParams")
                     }
-                }
-                diagLog(
-                    "island hooks installed: ${cls.name} (${methods.size} methods) " +
-                        methods.take(40).joinToString(",") { it.name }
-                )
-            }.onFailure {
-                XposedLog.e(HOOK_TAG, lpparam.packageName, "island hook all-methods failed: $name: ${it.message}")
-            }
-            installedAny = true
-        }
-        if (installedAny) {
-            islandHooksInstalled = true
-        } else if (DIAG_LOG && islandHookAttempts >= ISLAND_HOOK_MAX_ATTEMPTS) {
-            diagLog("island hooks: 所有候选类都没找到，等插件加载/降级到通用检测")
-        }
-    }
-
-    private fun hookPluginLoadForIslandHooks() {
-        if (pluginLoadHookInstalled) return
-        runCatching {
-            val cls = loadClassOrNull(
-                "com.android.systemui.shared.plugins.PluginInstance\$PluginFactory",
-                lpparam.classLoader
-            ) ?: return
-            cls.declaredMethods.filter { it.name == "createPluginContext" }.createAfterHooks { param ->
-                if (islandHooksInstalled) return@createAfterHooks
-                val loader = runCatching { param.result?.callMethod("getClassLoader") as? ClassLoader }.getOrNull()
-                    ?: runCatching {
-                        param.thisObject.getObjectFieldOrNull("mClassLoader") as? ClassLoader
-                    }.getOrNull()
-                if (loader != null) ensureIslandEventHooks(loader)
-            }
-            pluginLoadHookInstalled = true
-        }.onFailure {
-            XposedLog.e(HOOK_TAG, lpparam.packageName, "hook plugin load failed: ${it.message}")
-        }
-    }
-
-    private fun setupGenericIslandViewDetector() {
-        runCatching {
-            val viewCls = android.view.View::class.java
-            listOf("onAttachedToWindow", "onVisibilityChanged", "setVisibility").forEach { name ->
-                viewCls.declaredMethods.filter { it.name == name }.createBeforeHooks { param ->
-                    val v = param.thisObject as? View ?: return@createBeforeHooks
-                    if (!isIslandView(v.javaClass)) return@createBeforeHooks
-                    onIslandEvent("generic.$name:${v.javaClass.simpleName}", v)
+                    val title = (runCatching { attrs?.callMethod("getTitle") }.getOrNull()
+                        ?: runCatching { attrs?.getObjectFieldOrNull("title") }.getOrNull())?.toString() ?: ""
+                    val views = args.filterIsInstance<View>()
+                    val root = views.firstOrNull { it.javaClass.name.contains("island", ignoreCase = true) }
+                        ?: views.firstOrNull().takeIf { title.contains("island", ignoreCase = true) }
+                        ?: return@runCatching
+                    islandRootRef = java.lang.ref.WeakReference(root)
+                    islandWindowTitle = title
+                    diagLog("island window attached: $title root=" + root.javaClass.simpleName)
                 }
             }
         }.onFailure {
-            XposedLog.e(HOOK_TAG, lpparam.packageName, "generic island detector failed: ${it.message}")
+            XposedLog.e(HOOK_TAG, lpparam.packageName, "hook ViewRootImpl.setView failed: " + it.message)
         }
     }
 
-    private fun isIslandView(cls: Class<*>): Boolean {
-        islandClassCache[cls]?.let { return it }
-        val hit = cls.name.contains("island", ignoreCase = true) || cls.name.contains("dynamicisland", ignoreCase = true)
-        islandClassCache[cls] = hit
-        return hit
+    private fun pollIslandState() {
+        val root = islandRootRef?.get() ?: return
+        if (checkIslandVisible(root) == lastIslandVisible) return
+        lastIslandVisible = !lastIslandVisible
+        onIslandStateChanged(lastIslandVisible)
+        if (lastIslandVisible) startIslandFastPoll()
     }
 
-    private fun hookIslandEvent(className: String, methodName: String, reason: String) {
-        runCatching {
-            val cls = loadClassOrNull(className, lpparam.classLoader)
-            if (cls == null) {
-                if (DIAG_LOG) diagLog("island hook miss(class): $className")
-                return
+    private fun checkIslandVisible(root: View): Boolean =
+        runCatching { root.isShown && root.visibility == View.VISIBLE }.getOrDefault(false)
+
+    private fun startIslandFastPoll() {
+        if (islandFastPolling) return
+        islandFastPolling = true
+        var elapsed = 0L
+        val step = object : Runnable {
+            override fun run() {
+                elapsed += ISLAND_FAST_POLL_MS
+                val root = islandRootRef?.get()
+                val visible = root != null && checkIslandVisible(root)
+                if (visible != lastIslandVisible) {
+                    lastIslandVisible = visible
+                    onIslandStateChanged(visible)
+                }
+                if (elapsed < ISLAND_FAST_POLL_MAX_MS && lastIslandVisible) {
+                    mainHandler?.postDelayed(this, ISLAND_FAST_POLL_MS)
+                } else {
+                    islandFastPolling = false
+                }
             }
-            val methods = (cls.declaredMethods.toList() + cls.methods.toList())
-                .distinct()
-                .filter { it.name == methodName }
-            if (methods.isEmpty()) {
-                if (DIAG_LOG) diagLog("island hook miss(method): $className#$methodName")
-                return
-            }
-            methods.createBeforeHooks { param ->
-                onIslandEvent(reason, param.thisObject as? View)
-            }
-        }.onFailure {
-            XposedLog.e(HOOK_TAG, lpparam.packageName, "island hook failed: $className#$methodName: ${it.message}")
         }
+        mainHandler?.postDelayed(step, ISLAND_FAST_POLL_MS)
     }
 
-    private fun onIslandEvent(reason: String, source: View?) {
-        if (DIAG_LOG && loggedIslandEvents.add(reason)) {
-            diagLog("island event(new): $reason")
-        }
-        if (source != null) {
-            val island = IntArray(2)
-            runCatching { source.getLocationOnScreen(island) }
-            val iw = source.width
-            val ih = source.height
-            diagLog(
-                "  island view=${source.javaClass.simpleName} onScreen=[${island[0]},${island[1]}," +
-                    "${island[0] + iw},${island[1] + ih}] size=${iw}x$ih vis=${source.visibility} " +
-                    "alpha=${source.alpha} scale=${source.scaleX},${source.scaleY} layer=${source.layerType}"
-            )
-            if (PROBE_MATERIAL) diagLog(materialProbe(source, "island"))
-        }
-        if (PROBE_MATERIAL) {
-            for (view in mStatusbarTextIcons) {
-                if (!view.isAttachedToWindow) continue
-                val loc = IntArray(2)
-                runCatching { view.getLocationOnScreen(loc) }
-                val w = view.width
-                val h = view.height
-                diagLog(
-                    "  ours host=${hostName(view)} onScreen=[${loc[0]},${loc[1]},${loc[0] + w},${loc[1] + h}] " +
-                        "shown=${runCatching { view.isShown }.getOrDefault(false)}"
-                )
-                diagLog(materialProbe(view, "ours@${hostName(view)}"))
-                findClockOf(view)?.let { diagLog(materialProbe(it, "clock-ref")) }
-            }
+    private fun onIslandStateChanged(visible: Boolean) {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastIslandEventAt < ISLAND_EVENT_COOLDOWN_MS) return
+        lastIslandEventAt = now
+        val reason = if (visible) "island.show" else "island.hide"
+        if (DIAG_LOG) {
+            diagLog("island state changed: visible=$visible title=$islandWindowTitle")
+            dumpIslandAndOurs()
         }
         scheduleRenderReset(reason)
+        islandRepair(reason, settle = true)
+    }
+
+    private fun shownIndicator(): View? = mStatusbarTextIcons.firstOrNull {
+        it.isAttachedToWindow && runCatching { it.isShown }.getOrDefault(false)
+    }
+
+    private fun dumpIslandAndOurs() {
+        if (probeLinesLogged >= PROBE_LINE_CAP) return
+        val ours = shownIndicator() ?: return
+        islandRootRef?.get()?.let { island ->
+            val loc = IntArray(2)
+            runCatching { island.getLocationOnScreen(loc) }
+            diagLog(
+                "  island root=" + island.javaClass.simpleName +
+                    " onScreen=[" + loc[0] + "," + loc[1] + "," + (loc[0] + island.width) + "," + (loc[1] + island.height) + "]" +
+                    " vis=" + island.visibility +
+                    " shown=" + runCatching { island.isShown }.getOrDefault(false)
+            )
+            probeLinesLogged += 2
+            diagLog(materialProbe(island, "island"))
+            probeLinesLogged += 6
+        }
+        diagLog(materialProbe(ours, "ours@" + hostName(ours)))
+        probeLinesLogged += 6
+        findClockOf(ours)?.let {
+            diagLog(materialProbe(it, "clock-ref"))
+            probeLinesLogged += 6
+        }
     }
 
     private fun islandRepair(reason: String, settle: Boolean) {
         if (!settle) return
-        for (view in mStatusbarTextIcons) {
-            if (!view.isAttachedToWindow) continue
-            if (CLEAR_OWN_BLUR) clearOwnBlur(view, reason)
-            if (MIRROR_REFERENCE_MATERIAL) mirrorReferenceMaterial(view, reason)
-            if (REATTACH_ON_SETTLE) reattachIndicator(view, reason)
-            if (FORCE_WINDOW_REDRAW_ON_SETTLE) forceWindowRedraw(view, reason)
-        }
+        val view = shownIndicator() ?: return
+        if (CLEAR_OWN_BLUR) clearOwnBlur(view, reason)
+        if (MIRROR_REFERENCE_MATERIAL) mirrorReferenceMaterial(view, reason)
+        if (REATTACH_ON_SETTLE) reattachIndicator(view, reason)
+        if (FORCE_WINDOW_REDRAW_ON_SETTLE) forceWindowRedraw(view, reason)
     }
 
     private fun clearOwnBlur(view: View, reason: String) {
@@ -509,7 +457,7 @@ object BatteryDetailIndicator : BaseHook() {
             miCall(view, "removeBackgroundBlurDrawable")
             miCall(view, "setSelfBlurRadius", 0f)
         }.onFailure {
-            XposedLog.e(HOOK_TAG, lpparam.packageName, "clearOwnBlur failed($reason): ${it.message}")
+            XposedLog.e(HOOK_TAG, lpparam.packageName, "clearOwnBlur failed(" + reason + "): " + it.message)
         }
     }
 
@@ -523,7 +471,7 @@ object BatteryDetailIndicator : BaseHook() {
         miCall(view, "setMiBackgroundBlurMode", bgMode ?: 0)
         miCall(view, "setPassWindowBlurEnabled", pass ?: false)
         runCatching { MiBlurUtils.setMemberBlendColor(view, false, color) }
-        diagLog("mirror($reason): clock mode=$mode bgMode=$bgMode pass=$pass color=${java.lang.Integer.toHexString(color)}")
+        diagLog("mirror(" + reason + "): clock mode=" + mode + " bgMode=" + bgMode + " pass=" + pass)
     }
 
     private fun reattachIndicator(view: View, reason: String) {
@@ -534,9 +482,9 @@ object BatteryDetailIndicator : BaseHook() {
         runCatching {
             parent.removeView(view)
             parent.addView(view, index.coerceAtMost(parent.childCount), lp)
-            diagLog("reattach($reason): host=${hostName(view)} index=$index")
+            diagLog("reattach(" + reason + "): host=" + hostName(view))
         }.onFailure {
-            XposedLog.e(HOOK_TAG, lpparam.packageName, "reattach failed($reason): ${it.message}")
+            XposedLog.e(HOOK_TAG, lpparam.packageName, "reattach failed(" + reason + "): " + it.message)
         }
     }
 
@@ -545,19 +493,19 @@ object BatteryDetailIndicator : BaseHook() {
             val root = view.rootView
             root.invalidate()
             (root as? ViewGroup)?.requestLayout()
-            diagLog("windowRedraw($reason): root=${root.javaClass.simpleName}")
+            diagLog("windowRedraw(" + reason + "): root=" + root.javaClass.simpleName)
         }.onFailure {
-            XposedLog.e(HOOK_TAG, lpparam.packageName, "forceWindowRedraw failed($reason): ${it.message}")
+            XposedLog.e(HOOK_TAG, lpparam.packageName, "forceWindowRedraw failed(" + reason + "): " + it.message)
         }
     }
 
     private fun materialProbe(view: View, label: String): String {
-        val sb = StringBuilder("  material[$label]")
+        val sb = StringBuilder("  material[" + label + "]")
         var current: View? = view
         var depth = 0
         while (current != null && depth < 6) {
             val cur = current
-            sb.append("\n    ").append(if (depth == 0) "self" else "anc$depth")
+            sb.append("\n    ").append(if (depth == 0) "self" else "anc" + depth)
                 .append(' ').append(cur.javaClass.simpleName)
                 .append(" blurMode=").append(miInt(cur, "getMiViewBlurMode"))
                 .append(" bgMode=").append(miInt(cur, "getMiBackgroundBlurMode"))
@@ -758,6 +706,9 @@ object BatteryDetailIndicator : BaseHook() {
     }
 
     private fun dumpIcons(reason: String) {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastDumpAt < DUMP_COOLDOWN_MS) return
+        lastDumpAt = now
         if (!DIAG_LOG) return
         val tracked = mStatusbarTextIcons.size
         val attached = mStatusbarTextIcons.count { it.isAttachedToWindow }
@@ -873,7 +824,7 @@ object BatteryDetailIndicator : BaseHook() {
 
     private fun updateStatusbarViews(tii: TextIconInfo) {
 
-        if (!islandHooksInstalled) ensureIslandEventHooks(null)
+        pollIslandState()
 
         pruneTrackedIcons("tick")
         dedupeAll("tick")
