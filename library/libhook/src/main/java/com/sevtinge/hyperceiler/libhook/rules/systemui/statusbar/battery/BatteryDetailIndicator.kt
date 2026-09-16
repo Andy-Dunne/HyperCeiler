@@ -37,6 +37,7 @@ import android.widget.TextView
 import com.sevtinge.hyperceiler.common.log.XposedLog
 import com.sevtinge.hyperceiler.common.utils.PrefsBridge
 import com.sevtinge.hyperceiler.libhook.base.BaseHook
+import com.sevtinge.hyperceiler.libhook.utils.api.DeviceHelper.System.isMoreAndroidVersion
 import com.sevtinge.hyperceiler.libhook.utils.api.DisplayUtils.dp2px
 import io.github.lingqiqi5211.ezhooktool.core.callMethod
 import io.github.lingqiqi5211.ezhooktool.core.callStaticMethod
@@ -56,6 +57,21 @@ import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * Hook rule to display real-time battery detail info (temperature, current, wattage) in status bar.
+ *
+ * 本次改动（只动"状态归属"，不改绘制外观）：
+ *
+ * 1. 渲染状态复位从 setVisibleState 里抽成 resetRenderState()，并挂到灵动岛（焦点通知）的
+ *    各个事件入口 + 每次 tick 兜底。原来的复位只挂在 setVisibleState 上，而灵动岛走的不是
+ *    那条链路，所以第二个岛通知（如充电动画）插进来时残留的状态永远不会被清掉 -> 必糊。
+ *
+ * 2. 实例唯一化：注入时同容器内去重，tick 时淘汰已经脱离视图树的实例。灵动岛切换期间状态栏
+ *    布局可能被重建/重新插入，两份指示器叠在一起看起来就是"糊/重影"。
+ *
+ * 3. 诊断日志（DIAG_LOG）：打印实例数、attached 状态、layer/alpha/scale/translation、父链、
+ *    坐标，以及只读的 MIUI 材质状态和目标 View 树里带标记的节点数，用来判定故障属于
+ *    "多实例 / 动画中间态 / 遮挡材质" 中的哪一类。修好后把 DIAG_LOG 改成 false 即可。
+ *
+ * 注意：诊断日志走 XposedLog.d，需要在模块设置里把日志级别调到 Debug 才能看到。
  */
 object BatteryDetailIndicator : BaseHook() {
 
@@ -65,6 +81,30 @@ object BatteryDetailIndicator : BaseHook() {
     private const val ICON_TYPE = 91
     private const val MSG_DATA_UPDATE = 100021
     private const val MSG_WORKER_TICK = 200021
+
+    // ------------------------------------------------------------------ 调试开关
+
+    /** 事件级诊断日志（灵动岛事件、注入、tick 复位）。定位期间保持 true，修好后改 false。 */
+    private const val DIAG_LOG = true
+
+    /** 每 tick 都 dump 一次会刷屏，默认关。需要连续曲线数据时再打开。 */
+    private const val DIAG_LOG_TICK = false
+
+    /**
+     * tick（每 2 秒）的兜底复位是否也做"强化版"（HARDWARE -> NONE 强制重栅格化 + 逐级 invalidate）。
+     * 定位阶段建议设成 true：这样"事件复位漏掉的那一次"最多 2 秒就会被强行清掉，
+     * 如果此时糊掉会在 2 秒内自愈，就直接证明原因是"渲染状态停在中间态"；
+     * 如果 2 秒后依然糊，则原因是多实例或遮挡，需要看 dump 日志里的实例数与坐标。
+     */
+    private const val STRONG_RESET_ON_TICK = false
+
+    /**
+     * 灵动岛动画时长不确定，事件发生后在若干时间点补做复位：
+     * - 0ms：立刻清掉上一轮事件可能留下的陈旧状态
+     * - 120/320ms：动画进行中，只做"轻复位"，不和系统的动画抢属性
+     * - 700/1500ms：动画应当已经结束，做"强复位"（含强制重栅格化）并抓一次现场
+     */
+    private val RESET_DELAYS = longArrayOf(0L, 120L, 320L, 700L, 1500L)
 
     private const val TAG_SLOT_TEXT_ICON = "slot_text_icon"
     private const val TAG_NETWORK_SPEED_NUMBER = "network_speed_number"
@@ -88,6 +128,17 @@ object BatteryDetailIndicator : BaseHook() {
     private const val METHOD_SET_NETWORK_SPEED = "setNetworkSpeed"
     private const val METHOD_IS_CHARGING = "isCharging"
     private const val METHOD_ADD_DARK_RECEIVER = "addDarkReceiver"
+
+    // 灵动岛（焦点通知）相关入口
+    private const val CLS_FOCUS_NOTIF_PROMPT_CONTROLLER = "com.android.systemui.statusbar.phone.FocusedNotifPromptController"
+    private const val CLS_FOCUS_NOTIF_PROMPT_VIEW = "com.android.systemui.statusbar.phone.FocusedNotifPromptView"
+    private const val CLS_MIUI_COLLAPSED_STATUS_BAR = "com.android.systemui.statusbar.phone.MiuiCollapsedStatusBarFragment"
+    private const val CLS_RECENTS_PROXY_NEW = "com.android.systemui.recents.LauncherProxyService"
+    private const val CLS_RECENTS_PROXY_OLD = "com.android.systemui.recents.OverviewProxyService"
+    private const val METHOD_NOTIFY_NOTIF_BEAN_CHANGED = "notifyNotifBeanChanged"
+    private const val METHOD_SET_DATA = "setData"
+    private const val METHOD_UPDATE_STATUS_BAR_VISIBILITIES = "updateStatusBarVisibilities"
+    private const val METHOD_ON_FOCUSED_NOTIF_UPDATE = "onFocusedNotifUpdate"
 
     private const val PKG_SYSTEMUI = "com.android.systemui"
     private const val PROP_POWER_SUPPLY_TEMP = "POWER_SUPPLY_TEMP"
@@ -186,6 +237,7 @@ object BatteryDetailIndicator : BaseHook() {
         }
 
         startDataCollection()
+        setupIslandEventHooks()
         setupHotReloadCleanup()
     }
 
@@ -213,21 +265,31 @@ object BatteryDetailIndicator : BaseHook() {
             XposedLog.e(HOOK_TAG, lpparam.packageName, "Failed to hook NetworkSpeedView.getSlot: ${it.message}")
         }
 
-         runCatching {
-            nsvCls.declaredMethods
-            .filter { it.name == "setVisibleState" }
-            .createAfterHooks { param ->
-                val nsView = param.thisObject as? View ?: return@createAfterHooks
-                if (!ViewHelper.isCustomTextIcon(nsView)) return@createAfterHooks
-                val state = param.args.getOrNull(0) as? Int ?: 0
-                val visible = state != 2
-                val number = nsView.getObjectFieldOrNullAs<TextView>(FIELD_NETWORK_SPEED_NUMBER_TEXT)
-                       ?: (nsView as? TextView)
-                number?.visibility = if (visible) View.VISIBLE else View.GONE
+        runCatching {
+            nsvCls.declaredMethods.filter { it.name == "setVisibleState" }.createBeforeHooks { param ->
+                val nsView = param.thisObject as? View
+                if (nsView != null && ViewHelper.isCustomTextIcon(nsView)) {
+                    val state = param.args.getOrNull(0) as? Int ?: 0
+                    val visible = state != 2
 
-                nsView.requestLayout()
-                nsView.invalidate()            
-               }
+                    val number = nsView.getObjectFieldOrNullAs<TextView>(FIELD_NETWORK_SPEED_NUMBER_TEXT)
+                        ?: (nsView as? TextView)
+                    val unit = nsView.getObjectFieldOrNullAs<TextView>(FIELD_NETWORK_SPEED_UNIT_TEXT)
+
+                    val v = if (visible) View.VISIBLE else View.GONE
+                    number?.visibility = v
+                    unit?.visibility = v
+                    nsView.visibility = v
+
+                    nsView.invalidate()
+                    nsView.requestLayout()
+
+                    // 原来的 setLayerType(HARDWARE -> NONE) 写法保留在 resetRenderState(strong = true) 里，
+                    // 但不再只依赖这一个入口：灵动岛不走 setVisibleState，所以这里只做"顺带复位"。
+                    resetRenderState(nsView, strong = true, reason = "setVisibleState")
+                    scheduleRenderReset("setVisibleState")
+                }
+            }
         }.onFailure {
             XposedLog.e(HOOK_TAG, lpparam.packageName, "Failed to hook NetworkSpeedView.setVisibleState: ${it.message}")
         }
@@ -240,6 +302,8 @@ object BatteryDetailIndicator : BaseHook() {
                 if (nsView != null && ViewHelper.isCustomTextIcon(nsView)) {
                     val lp = nsView.layoutParams ?: LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT)
                     ViewHelper.initStatusbarTextIcon(nsView.context, lp, nsView, false)
+                    // 字体/主题/密度变化会重建绘制资源，顺手把渲染状态拉回中性
+                    resetRenderState(nsView, strong = true, reason = "resourcesChanged")
                 }
             }
         }
@@ -252,6 +316,264 @@ object BatteryDetailIndicator : BaseHook() {
                 if (nsView != null && ViewHelper.isCustomTextIcon(nsView)) {
                     syncColorWithClock(nsView)
                 }
+            }
+        }
+    }
+
+    // ==================================================================
+    // 灵动岛（焦点通知）事件 -> 主动复位
+    // ==================================================================
+
+    /**
+     * 灵动岛是唯一会重排状态栏几何、切换整片可见性、并且会播放"会被第二个通知打断的动画"的流程。
+     * 指示器是系统不认识的编外 View，系统收尾动画时不会照顾它，所以每个岛事件之后都要复位一次。
+     *
+     * 这里挂的入口和 HideFakeStatusBar.kt 里已经验证过的一致：
+     * - FocusedNotifPromptController.notifyNotifBeanChanged：焦点通知内容更新（例如音乐 -> 充电）
+     * - FocusedNotifPromptView.setData：岛的数据刷新（会重播动画）
+     * - MiuiCollapsedStatusBarFragment.updateStatusBarVisibilities：整片可见性状态机
+     * - LauncherProxyService / OverviewProxyService.onFocusedNotifUpdate：岛动画的目标矩形（几何重排）
+     */
+    private fun setupIslandEventHooks() {
+        hookIslandEvent(CLS_FOCUS_NOTIF_PROMPT_CONTROLLER, METHOD_NOTIFY_NOTIF_BEAN_CHANGED, "island.notifyChanged")
+        hookIslandEvent(CLS_FOCUS_NOTIF_PROMPT_VIEW, METHOD_SET_DATA, "island.setData")
+        hookIslandEvent(CLS_MIUI_COLLAPSED_STATUS_BAR, METHOD_UPDATE_STATUS_BAR_VISIBILITIES, "island.visibilities")
+        val recentsCls = if (isMoreAndroidVersion(36)) CLS_RECENTS_PROXY_NEW else CLS_RECENTS_PROXY_OLD
+        hookIslandEvent(recentsCls, METHOD_ON_FOCUSED_NOTIF_UPDATE, "island.animTarget")
+    }
+
+    private fun hookIslandEvent(className: String, methodName: String, reason: String) {
+        runCatching {
+            val cls = loadClassOrNull(className, lpparam.classLoader)
+            if (cls == null) {
+                if (DIAG_LOG) XposedLog.d(HOOK_TAG, lpparam.packageName, "island hook miss(class): $className")
+                return
+            }
+            val methods = (cls.declaredMethods.toList() + cls.methods.toList())
+                .distinct()
+                .filter { it.name == methodName }
+            if (methods.isEmpty()) {
+                if (DIAG_LOG) XposedLog.d(HOOK_TAG, lpparam.packageName, "island hook miss(method): $className#$methodName")
+                return
+            }
+            methods.createBeforeHooks {
+                if (DIAG_LOG) {
+                    XposedLog.d(HOOK_TAG, lpparam.packageName, "island event: $reason ($className#$methodName)")
+                }
+                scheduleRenderReset(reason)
+            }
+        }.onFailure {
+            XposedLog.e(HOOK_TAG, lpparam.packageName, "island hook failed: $className#$methodName: ${it.message}")
+        }
+    }
+
+    // ==================================================================
+    // 渲染状态复位
+    // ==================================================================
+
+    /**
+     * 把指示器拉回"中性渲染状态"，不改变可见性策略（可见性仍由 setVisibilityByController /
+     * 系统状态机决定），只清掉缩放、位移、透明度、图层这些"被系统动画留在中间态"的属性。
+     *
+     * @param strong 额外做一次 HARDWARE -> NONE 强制重栅格化，并逐级 invalidate 父容器
+     *               （用于动画被打断、图层里留着陈旧位图的情况）
+     */
+    private fun resetRenderState(view: View, strong: Boolean, reason: String) {
+        runCatching {
+            view.setLayerType(View.LAYER_TYPE_NONE, null)
+            view.alpha = 1f
+            view.scaleX = 1f
+            view.scaleY = 1f
+            view.translationX = 0f
+            view.translationY = 0f
+            view.invalidate()
+
+            val number = view.getObjectFieldOrNullAs<TextView>(FIELD_NETWORK_SPEED_NUMBER_TEXT) ?: (view as? TextView)
+            if (number != null) {
+                number.setLayerType(View.LAYER_TYPE_NONE, null)
+                number.alpha = 1f
+                number.scaleX = 1f
+                number.scaleY = 1f
+                number.translationX = 0f
+                number.translationY = 0f
+                if (strong) {
+                    // 强制重新栅格化：某些情况下图层里留的是被缩放过的陈旧内容，直接 invalidate 不会重画
+                    number.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+                    number.invalidate()
+                    number.setLayerType(View.LAYER_TYPE_NONE, null)
+                }
+                number.invalidate()
+            }
+
+            if (strong) {
+                var parent: View? = view.parent as? View
+                var depth = 0
+                while (parent != null && depth < 3) {
+                    parent.invalidate()
+                    parent = parent.parent as? View
+                    depth++
+                }
+            }
+        }.onFailure {
+            XposedLog.e(HOOK_TAG, lpparam.packageName, "resetRenderState failed($reason): ${it.message}")
+        }
+
+        if (DIAG_LOG) {
+            XposedLog.d(HOOK_TAG, lpparam.packageName, "reset($reason,strong=$strong): ${describeView(view)}")
+        }
+    }
+
+    private fun resetAllIcons(reason: String, strong: Boolean) {
+        pruneTrackedIcons(reason)
+        var skipped = 0
+        for (view in mStatusbarTextIcons) {
+            if (!view.isAttachedToWindow) {
+                skipped++
+                continue
+            }
+            resetRenderState(view, strong, reason)
+        }
+        if (DIAG_LOG && skipped > 0) {
+            XposedLog.d(HOOK_TAG, lpparam.packageName, "reset($reason) skipped detached=$skipped")
+        }
+    }
+
+    /** 事件发生后按 RESET_DELAYS 在多个时间点补复位，避免"动画结束时刻"抓不准 */
+    private fun scheduleRenderReset(reason: String) {
+        val handler = mainHandler
+        if (handler == null) {
+            resetAllIcons("$reason:sync", true)
+            return
+        }
+        for (delay in RESET_DELAYS) {
+            handler.postDelayed({
+                // 动画进行中的时间点只做轻复位，避免和系统的动画抢属性
+                val strong = delay == 0L || delay >= 700L
+                resetAllIcons("$reason+${delay}ms", strong)
+                if (DIAG_LOG && delay >= 700L) dumpIcons("$reason+${delay}ms")
+            }, delay)
+        }
+    }
+
+    // ==================================================================
+    // 实例唯一化（防止多份指示器叠加导致的"糊/重影"）
+    // ==================================================================
+
+    /** 清掉已经脱离视图树的实例（parent 为 null 的实例永远不可能再显示） */
+    private fun pruneTrackedIcons(reason: String) {
+        if (mStatusbarTextIcons.isEmpty()) return
+        var removed = 0
+        for (view in mStatusbarTextIcons) {
+            if (view.parent == null && mStatusbarTextIcons.remove(view)) {
+                removed++
+            }
+        }
+        if (DIAG_LOG && removed > 0) {
+            XposedLog.d(HOOK_TAG, lpparam.packageName, "prune($reason) removed=$removed left=${mStatusbarTextIcons.size}")
+        }
+    }
+
+    /**
+     * 同一个容器里只允许存在一份指示器。
+     * 灵动岛切换期间状态栏布局可能被重建或重新插入，两份文字叠在一起看起来就是"糊/重影"，
+     * 而且这类问题不会因为改文字渲染方式而消失（这也是之前一直修不好的原因之一）。
+     */
+    private fun dedupeInContainer(container: ViewGroup, keep: View?, reason: String) {
+        if (container.childCount <= 1) return
+        val duplicates = ArrayList<View>()
+        for (i in 0 until container.childCount) {
+            val child = container.getChildAt(i)
+            if (child !== keep && ViewHelper.isCustomTextIcon(child)) {
+                duplicates.add(child)
+            }
+        }
+        if (duplicates.isEmpty()) return
+        for (child in duplicates) {
+            // 先抓现场再移除，日志里的 parent 才是有用的（移除后就变成 null 了）
+            val snapshot = if (DIAG_LOG) describeView(child) else null
+            runCatching { container.removeView(child) }
+            mStatusbarTextIcons.remove(child)
+            if (snapshot != null) {
+                XposedLog.w(HOOK_TAG, lpparam.packageName, "dedupe($reason) removed duplicate: $snapshot")
+            }
+        }
+    }
+
+    private fun dedupeAll(reason: String) {
+        for (view in mStatusbarTextIcons) {
+            if (!view.isAttachedToWindow) continue
+            val parent = view.parent as? ViewGroup ?: continue
+            dedupeInContainer(parent, view, reason)
+        }
+    }
+
+    // ==================================================================
+    // 诊断（定位糊掉属于哪一类）
+    // ==================================================================
+
+    private fun dumpIcons(reason: String) {
+        if (!DIAG_LOG) return
+        val tracked = mStatusbarTextIcons.size
+        val attached = mStatusbarTextIcons.count { it.isAttachedToWindow }
+        XposedLog.d(HOOK_TAG, lpparam.packageName, "==== dump[$reason] tracked=$tracked attached=$attached ====")
+        for (view in mStatusbarTextIcons) {
+            XposedLog.d(HOOK_TAG, lpparam.packageName, "  tracked: ${describeView(view)}")
+        }
+        val root = mStatusbarTextIcons.firstOrNull { it.isAttachedToWindow }?.rootView
+        if (root != null) {
+            val found = ArrayList<View>()
+            collectTaggedIcons(root, found)
+            XposedLog.d(HOOK_TAG, lpparam.packageName, "  taggedInRoot=${found.size} root=${root.javaClass.name}")
+            found.forEachIndexed { index, view ->
+                XposedLog.d(HOOK_TAG, lpparam.packageName, "    #$index ${describeView(view)}")
+            }
+        }
+        XposedLog.d(HOOK_TAG, lpparam.packageName, "==== dump end[$reason] ====")
+    }
+
+    private fun describeView(view: View): String = buildString {
+        append("cls=").append(view.javaClass.simpleName)
+        append('@').append(java.lang.Integer.toHexString(java.lang.System.identityHashCode(view)))
+        append(" vis=").append(view.visibility)
+        append(" attached=").append(view.isAttachedToWindow)
+        append(" shown=").append(runCatching { view.isShown }.getOrDefault(false))
+        append(" layer=").append(view.layerType)
+        append(" alpha=").append(view.alpha)
+        append(" scale=").append(view.scaleX).append(',').append(view.scaleY)
+        append(" trans=").append(view.translationX).append(',').append(view.translationY)
+        append(" bounds=[").append(view.left).append(',').append(view.top).append(',')
+        append(view.right).append(',').append(view.bottom).append(']')
+        append(" size=").append(view.width).append('x').append(view.height)
+        append(" parent=").append(parentChain(view))
+        append(' ').append(miuiBlurState(view))
+    }
+
+    private fun parentChain(view: View, depth: Int = 4): String {
+        val sb = StringBuilder()
+        var current: View? = view.parent as? View
+        var level = 0
+        while (current != null && level < depth) {
+            if (level > 0) sb.append(" < ")
+            sb.append(current.javaClass.simpleName)
+            current = current.parent as? View
+            level++
+        }
+        return sb.toString()
+    }
+
+    /** 只读取 MIUI 的 View 材质状态（方法不存在就跳过），用于判断"糊"是否由材质引起 */
+    private fun miuiBlurState(view: View): String {
+        val viewMode = runCatching { view.callMethod("getMiViewBlurMode") as? Int }.getOrNull()
+        val bgMode = runCatching { view.callMethod("getMiBackgroundBlurMode") as? Int }.getOrNull()
+        val passWindow = runCatching { view.callMethod("getPassWindowBlurEnabled") as? Boolean }.getOrNull()
+        return "miBlur(viewMode=$viewMode,bgMode=$bgMode,passWindow=$passWindow)"
+    }
+
+    private fun collectTaggedIcons(view: View, out: MutableList<View>) {
+        if (ViewHelper.isCustomTextIcon(view)) out.add(view)
+        if (view is ViewGroup) {
+            for (i in 0 until view.childCount) {
+                collectTaggedIcons(view.getChildAt(i), out)
             }
         }
     }
@@ -292,6 +614,10 @@ object BatteryDetailIndicator : BaseHook() {
     }
 
     private fun updateStatusbarViews(tii: TextIconInfo) {
+        // 每 tick 先做一次"卫生"：淘汰失效实例 + 容器内去重，避免多份实例叠加
+        pruneTrackedIcons("tick")
+        dedupeAll("tick")
+
         for (tv in mStatusbarTextIcons) {
             runCatching { tv.callMethod(METHOD_SET_VISIBILITY_BY_CONTROLLER, tii.iconShow) }
                 .onFailure { tv.visibility = if (tii.iconShow) View.VISIBLE else View.GONE }
@@ -304,7 +630,14 @@ object BatteryDetailIndicator : BaseHook() {
                     }
                 syncColorWithClock(tv)
             }
+            // 兜底复位：任何一个 tick 都把渲染状态拉回中性，
+            // 这样"事件复位漏掉的那一次"最多 2 秒后也会自愈。
+            if (tv.isAttachedToWindow) {
+                resetRenderState(tv, strong = STRONG_RESET_ON_TICK, reason = "tick")
+            }
         }
+
+        if (DIAG_LOG_TICK) dumpIcons("tick")
     }
 
     private object RightSideHookHelper {
@@ -399,7 +732,7 @@ object BatteryDetailIndicator : BaseHook() {
 
         private fun setupIconManager(nsvCls: Class<*>) {
             val iconManagerCls = loadClassOrNull("com.android.systemui.statusbar.phone.ui.IconManager", lpparam.classLoader)
-                ?: loadClassOrNull("com.android.systemui.statusbar.phone.StatusBarIconController\$IconManager", lpparam.classLoader)
+                ?: loadClassOrNull("com.android.systemui.statusbar.phone.ui.IconManager", lpparam.classLoader)
                 ?: return
 
             runCatching {
@@ -428,14 +761,18 @@ object BatteryDetailIndicator : BaseHook() {
                 if (!mStatusbarTextIcons.contains(existing)) {
                     mStatusbarTextIcons.add(existing)
                 }
+                // 同一容器里如果已经有别的指示器（例如上一轮布局重建残留的），清掉
+                dedupeInContainer(mGroup, existing, "right.existing")
                 param.result = existing
             } else {
                 val iconView = ViewHelper.createStatusbarTextIcon(nsvCls, mContext, lp, true)
                 val index = (param.args[0] as? Int ?: 0).coerceAtLeast(0).coerceAtMost(mGroup.childCount)
                 mGroup.addView(iconView, index)
                 mStatusbarTextIcons.add(iconView)
+                dedupeInContainer(mGroup, iconView, "right.new")
                 param.result = iconView
             }
+            if (DIAG_LOG) dumpIcons("right.addHolder")
         }
     }
 
@@ -447,7 +784,7 @@ object BatteryDetailIndicator : BaseHook() {
         }
 
         private fun setupCollapsedStatusBar(nsvCls: Class<*>) {
-            val mcsbFragmentCls = loadClassOrNull("com.android.systemui.statusbar.phone.MiuiCollapsedStatusBarFragment", lpparam.classLoader)
+            val mcsbFragmentCls = loadClassOrNull(CLS_MIUI_COLLAPSED_STATUS_BAR, lpparam.classLoader)
                 ?: loadClassOrNull("com.android.systemui.statusbar.phone.CollapsedStatusBarFragment", lpparam.classLoader)
                 ?: return
 
@@ -544,12 +881,17 @@ object BatteryDetailIndicator : BaseHook() {
             providedDarkDispatcher: Any?
         ) {
             val container = targetContainer ?: (clockView?.parent as? ViewGroup) ?: return
+            pruneTrackedIcons("inject")
             val existing = container.findViewWithTag<View>(TAG_SLOT_TEXT_ICON)
             if (existing != null) {
                 if (!mStatusbarTextIcons.contains(existing)) {
                     mStatusbarTextIcons.add(existing)
                 }
+                // 布局重建后同一容器里可能残留多份指示器，这里直接清掉多余的那份
+                dedupeInContainer(container, existing, "left.existing")
                 syncColorWithClock(existing, clockView as? TextView)
+                resetRenderState(existing, strong = true, reason = "inject.existing")
+                if (DIAG_LOG) dumpIcons("left.inject.existing")
                 return
             }
 
@@ -568,14 +910,17 @@ object BatteryDetailIndicator : BaseHook() {
             }
             container.addView(iconView, index)
             mStatusbarTextIcons.add(iconView)
+            dedupeInContainer(container, iconView, "left.new")
             syncColorWithClock(iconView, clockView as? TextView)
             if (darkDispatcher != null) {
                 runCatching { darkDispatcher.callMethod(METHOD_ADD_DARK_RECEIVER, iconView) }
             }
+            resetRenderState(iconView, strong = true, reason = "inject.new")
+            if (DIAG_LOG) dumpIcons("left.inject.new")
         }
 
         private fun setupSystemIconAreaVisibility() {
-            val mcsbFragmentCls = loadClassOrNull("com.android.systemui.statusbar.phone.MiuiCollapsedStatusBarFragment", lpparam.classLoader)
+            val mcsbFragmentCls = loadClassOrNull(CLS_MIUI_COLLAPSED_STATUS_BAR, lpparam.classLoader)
                 ?: loadClassOrNull("com.android.systemui.statusbar.phone.CollapsedStatusBarFragment", lpparam.classLoader)
                 ?: return
 
@@ -585,6 +930,8 @@ object BatteryDetailIndicator : BaseHook() {
                         runCatching { v.callMethod(METHOD_SET_VISIBILITY_BY_CONTROLLER, true) }
                             .onFailure { v.visibility = View.VISIBLE }
                     }
+                    // 整片图标区重新出现，系统的淡入/位移动画刚结束，补一次复位
+                    scheduleRenderReset("showSystemIconArea")
                 }
             }
 
@@ -594,6 +941,7 @@ object BatteryDetailIndicator : BaseHook() {
                         runCatching { v.callMethod(METHOD_SET_VISIBILITY_BY_CONTROLLER, false) }
                             .onFailure { v.visibility = View.GONE }
                     }
+                    scheduleRenderReset("hideSystemIconArea")
                 }
             }
         }
@@ -767,10 +1115,6 @@ object BatteryDetailIndicator : BaseHook() {
             return iconView
         }
 
-        private fun isMultiLineContent(contentMode: Int): Boolean {
-            return contentMode == 1 || contentMode == 4 || contentMode == 5
-        }
-
         @SuppressLint("DiscouragedApi")
         fun initStatusbarTextIcon(
             mContext: Context,
@@ -825,13 +1169,6 @@ object BatteryDetailIndicator : BaseHook() {
             when (align) {
                 2 -> iconTextView.gravity = Gravity.START or Gravity.CENTER_VERTICAL
                 3 -> iconTextView.gravity = Gravity.CENTER
-                4 -> iconTextView.gravity = Gravity.END or Gravity.CENTER_VERTICAL
-                else -> iconTextView.gravity = Gravity.START or Gravity.CENTER_VERTICAL
-            }
-        }
-    }
-}
-
                 4 -> iconTextView.gravity = Gravity.END or Gravity.CENTER_VERTICAL
                 else -> iconTextView.gravity = Gravity.START or Gravity.CENTER_VERTICAL
             }
